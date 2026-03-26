@@ -35,23 +35,23 @@ The contracts support multiple liquidity distribution types to suit different tr
 
 These distribution types allow users to customize how liquidity is allocated across the grid, optimizing for specific market conditions or strategies.
 
-## Error Codes and Descriptions
+## Typed Errors
 
-- **E01**: The pool address cannot be zero.
-- **E02**: The position manager address cannot be zero.
-- **E03**: The grid quantity must be greater than 0 and less than or equal to 1,000.
-- **E04**: The grid step must be greater than 0 and less than or equal to 10,000.
-- **E05**: Invalid token amounts for the specified grid type.
-- **E06**: Slippage must be less than or equal to 500 basis points (5%).
-- **E07**: Exceeded the maximum number of active positions (1,000).
-- **E08**: Ticks must align with the pool's tick spacing.
-- **E09**: No tokens or Ether available for the operation.
-- **E10**: Price deviation exceeds the maximum allowable deviation.
-- **E11**: Position not found or invalid token ID.
-- **E12**: Missing required token1 amount for the BUY grid type.
-- **E13**: Missing required token0 amount for the SELL grid type.
-- **E14**: Missing required token amount for adding liquidity.
-- **E99**: Distribution type not implemented (e.g., Sigmoid or Logarithmic).
+- **PoolAddressZero()**: The pool address cannot be zero.
+- **PositionManagerAddressZero()**: The position manager address cannot be zero.
+- **InvalidGridQuantity(uint256 quantity)**: The grid quantity must be greater than 0 and less than or equal to 1,000.
+- **InvalidGridStep(uint256 stepBps)**: The grid step must be greater than 0 and less than or equal to 10,000.
+- **InvalidTokenAmountsForGridType()**: Invalid token amounts for the specified grid type.
+- **SlippageTooHigh(uint16 slippageBps)**: Slippage must be less than or equal to 500 basis points (5%).
+- **MaxActivePositionsExceeded(uint256 activePositions)**: Exceeded the maximum number of active positions (1,000).
+- **TickSpacingMisaligned(int24 tickLower, int24 tickUpper, int24 tickSpacing)**: Ticks must align with the pool's tick spacing.
+- **NoAssetsAvailable()**: No tokens or Ether available for the operation.
+- **PriceDeviationTooHigh(uint256 observedDeviationBps, uint256 maxDeviationBps)**: Price deviation exceeds the maximum allowable deviation.
+- **PositionNotFound(bytes32 positionKey)**: Position not found for the provided core position key (owner, tickLower, tickUpper, salt).
+- **MissingToken1ForBuyGrid()**: Missing required token1 amount for the BUY grid type.
+- **MissingToken0ForSellGrid()**: Missing required token0 amount for the SELL grid type.
+- **MissingTokenAmountForAddLiquidity()**: Missing required token amount for adding liquidity.
+- **DistributionTypeNotImplemented(GridTypes.DistributionType distributionType)**: Distribution type not implemented (e.g., Sigmoid or Logarithmic).
 
 ## Architecture
 
