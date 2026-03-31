@@ -6,7 +6,9 @@ library GridTypes {
         FLAT,
         LINEAR,
         REVERSE_LINEAR,
-        FIBONACCI
+        FIBONACCI,
+        SIGMOID,
+        LOGARITHMIC
     }
 
     struct GridConfig {
@@ -23,15 +25,14 @@ library GridTypes {
         uint128 liquidity;
     }
 
-    struct PoolRuntimeState {
+    struct PoolState {
         bool initialized;
-        uint32 liquidityOperations;
-        uint32 swapCount;
-        int24 lastLowerTick;
-        int24 lastUpperTick;
-        int256 lastSwapAmountSpecified;
         int24 currentTick;
+        uint32 swapCount;
+    }
+
+    struct UserGridState {
+        bool deployed;
         int24 gridCenterTick;
-        bool gridDeployed;
     }
 }

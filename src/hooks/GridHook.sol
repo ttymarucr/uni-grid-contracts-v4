@@ -1,58 +1,55 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {IHooks} from "v4-core/interfaces/IHooks.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {Position} from "v4-core/libraries/Position.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/types/BalanceDelta.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
-import {Currency} from "v4-core/types/Currency.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IHooks } from "v4-core/interfaces/IHooks.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import { Hooks } from "v4-core/libraries/Hooks.sol";
+import { Position } from "v4-core/libraries/Position.sol";
+import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
+import { BalanceDelta, BalanceDeltaLibrary } from "v4-core/types/BalanceDelta.sol";
+import { BeforeSwapDelta, BeforeSwapDeltaLibrary } from "v4-core/types/BeforeSwapDelta.sol";
+import { ModifyLiquidityParams, SwapParams } from "v4-core/types/PoolOperation.sol";
+import { Currency } from "v4-core/types/Currency.sol";
 
-import {GridTypes} from "../libraries/GridTypes.sol";
-import {DistributionWeights} from "../libraries/DistributionWeights.sol";
+import { GridTypes } from "../libraries/GridTypes.sol";
+import { DistributionWeights } from "../libraries/DistributionWeights.sol";
 
-contract GridHook is IHooks, IUnlockCallback, Ownable {
+contract GridHook is IHooks, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
+    using SafeERC20 for IERC20;
 
-    uint24 private constant MAX_GRID_ORDERS = 1_000;
+    uint24 private constant MAX_GRID_ORDERS = 1000;
     uint16 private constant MAX_SLIPPAGE_BPS = 500;
 
     enum UnlockAction {
         DEPLOY_GRID,
-        REBALANCE
+        REBALANCE,
+        CLOSE_GRID
     }
 
     error NotPoolManager();
-    error PoolAddressZero();
-    error PositionManagerAddressZero();
+    error PoolManagerAddressZero();
     error InvalidGridQuantity(uint256 quantity);
     error InvalidGridStep(uint256 stepBps);
-    error InvalidTokenAmountsForGridType();
     error SlippageTooHigh(uint16 slippageBps);
-    error MaxActivePositionsExceeded(uint256 activePositions);
     error TickSpacingMisaligned(int24 tickLower, int24 tickUpper, int24 tickSpacing);
     error NoAssetsAvailable();
-    error PriceDeviationTooHigh(uint256 observedDeviationBps, uint256 maxDeviationBps);
-    error PositionNotFound(bytes32 positionKey);
-    error MissingToken1ForBuyGrid();
-    error MissingToken0ForSellGrid();
-    error MissingTokenAmountForAddLiquidity();
-    error DistributionTypeNotImplemented(GridTypes.DistributionType distributionType);
-    error PoolNotConfigured(PoolId poolId);
+    error GridNotConfigured(PoolId poolId, address user);
     error PoolNotInitialized(PoolId poolId);
-    error GridAlreadyDeployed(PoolId poolId);
-    error GridNotDeployed(PoolId poolId);
+    error GridAlreadyDeployed(PoolId poolId, address user);
+    error GridNotDeployed(PoolId poolId, address user);
 
-    event PoolConfigured(
+    event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
+
+    event GridConfigured(
         PoolId indexed poolId,
+        address indexed user,
         int24 gridSpacing,
         uint24 maxOrders,
         uint16 rebalanceThresholdBps,
@@ -60,36 +57,27 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
         bool autoRebalance
     );
 
-    event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
-
-    event PoolInitializationPlanned(
-        PoolId indexed poolId, uint24 orderCount, GridTypes.DistributionType distributionType
-    );
-
-    event LiquidityObserved(
-        PoolId indexed poolId,
-        bool isAdd,
-        int24 tickLower,
-        int24 tickUpper,
-        int256 liquidityDelta,
-        bytes32 salt
-    );
+    event GridDeployed(PoolId indexed poolId, address indexed user, uint24 orderCount, uint128 totalLiquidity);
+    event GridRebalanced(PoolId indexed poolId, address indexed user, int24 oldCenterTick, int24 newCenterTick);
+    event GridClosed(PoolId indexed poolId, address indexed user);
 
     event SwapObserved(PoolId indexed poolId, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96);
 
-    event GridDeployed(PoolId indexed poolId, uint24 orderCount, uint128 totalLiquidity);
-    event GridRebalanced(PoolId indexed poolId, int24 oldCenterTick, int24 newCenterTick);
-    event RebalanceNeeded(PoolId indexed poolId, int24 currentTick, int24 gridCenterTick, uint256 deviationTicks);
-
     IPoolManager public immutable poolManager;
 
-    mapping(PoolId poolId => GridTypes.GridConfig config) private _poolConfigs;
-    mapping(PoolId poolId => GridTypes.PoolRuntimeState state) private _poolStates;
-    mapping(PoolId poolId => uint256[] weights) private _plannedWeights;
-    mapping(PoolId poolId => GridTypes.GridOrder[] orders) private _gridOrders;
+    // Pool-level state (shared across all users)
+    mapping(PoolId poolId => GridTypes.PoolState state) private _poolStates;
 
-    constructor(IPoolManager poolManager_, address initialOwner) Ownable(initialOwner) {
-        if (address(poolManager_) == address(0)) revert PositionManagerAddressZero();
+    // User-scoped state
+    mapping(address user => mapping(PoolId poolId => GridTypes.GridConfig config)) private _userConfigs;
+    mapping(address user => mapping(PoolId poolId => GridTypes.UserGridState state)) private _userStates;
+    mapping(address user => mapping(PoolId poolId => uint256[] weights)) private _userWeights;
+    mapping(address user => mapping(PoolId poolId => GridTypes.GridOrder[] orders)) private _userOrders;
+
+    constructor(
+        IPoolManager poolManager_
+    ) {
+        if (address(poolManager_) == address(0)) revert PoolManagerAddressZero();
         poolManager = poolManager_;
     }
 
@@ -98,7 +86,12 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
         _;
     }
 
-    function setPoolConfig(PoolKey calldata key, GridTypes.GridConfig calldata config) external onlyOwner {
+    // --- Configuration ---
+
+    function setGridConfig(
+        PoolKey calldata key,
+        GridTypes.GridConfig calldata config
+    ) external {
         uint256 spacing = config.gridSpacing > 0 ? uint256(uint24(config.gridSpacing)) : 0;
         if (spacing == 0 || spacing > 10_000) revert InvalidGridStep(spacing);
         if (config.maxOrders == 0 || config.maxOrders > MAX_GRID_ORDERS) {
@@ -107,10 +100,12 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
         if (config.rebalanceThresholdBps > MAX_SLIPPAGE_BPS) revert SlippageTooHigh(config.rebalanceThresholdBps);
 
         PoolId poolId = key.toId();
-        _poolConfigs[poolId] = config;
+        _userConfigs[msg.sender][poolId] = config;
+        _userWeights[msg.sender][poolId] = DistributionWeights.getWeights(config.maxOrders, config.distributionType);
 
-        emit PoolConfigured(
+        emit GridConfigured(
             poolId,
+            msg.sender,
             config.gridSpacing,
             config.maxOrders,
             config.rebalanceThresholdBps,
@@ -119,62 +114,107 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
         );
     }
 
-    function getPoolConfig(PoolKey calldata key) external view returns (GridTypes.GridConfig memory) {
-        return _poolConfigs[key.toId()];
+    // --- View Functions ---
+
+    function getGridConfig(
+        PoolKey calldata key,
+        address user
+    ) external view returns (GridTypes.GridConfig memory) {
+        return _userConfigs[user][key.toId()];
     }
 
-    function getPoolState(PoolKey calldata key) external view returns (GridTypes.PoolRuntimeState memory) {
+    function getPoolState(
+        PoolKey calldata key
+    ) external view returns (GridTypes.PoolState memory) {
         return _poolStates[key.toId()];
     }
 
-    function getPlannedWeights(PoolKey calldata key) external view returns (uint256[] memory) {
-        return _plannedWeights[key.toId()];
+    function getUserState(
+        PoolKey calldata key,
+        address user
+    ) external view returns (GridTypes.UserGridState memory) {
+        return _userStates[user][key.toId()];
     }
 
-    function getGridOrders(PoolKey calldata key) external view returns (GridTypes.GridOrder[] memory) {
-        return _gridOrders[key.toId()];
+    function getPlannedWeights(
+        PoolKey calldata key,
+        address user
+    ) external view returns (uint256[] memory) {
+        return _userWeights[user][key.toId()];
+    }
+
+    function getGridOrders(
+        PoolKey calldata key,
+        address user
+    ) external view returns (GridTypes.GridOrder[] memory) {
+        return _userOrders[user][key.toId()];
     }
 
     // --- Grid Operations ---
 
-    function deployGrid(PoolKey calldata key, uint128 totalLiquidity) external onlyOwner {
+    function deployGrid(
+        PoolKey calldata key,
+        uint128 totalLiquidity
+    ) external {
         PoolId poolId = key.toId();
-        _requireConfigured(poolId);
+        _requireUserConfigured(poolId, msg.sender);
 
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        if (!state.initialized) revert PoolNotInitialized(poolId);
-        if (state.gridDeployed) revert GridAlreadyDeployed(poolId);
+        GridTypes.PoolState storage pool = _poolStates[poolId];
+        if (!pool.initialized) revert PoolNotInitialized(poolId);
+
+        GridTypes.UserGridState storage userState = _userStates[msg.sender][poolId];
+        if (userState.deployed) revert GridAlreadyDeployed(poolId, msg.sender);
         if (totalLiquidity == 0) revert NoAssetsAvailable();
 
-        GridTypes.GridConfig storage config = _poolConfigs[poolId];
+        GridTypes.GridConfig storage config = _userConfigs[msg.sender][poolId];
         if (config.gridSpacing % key.tickSpacing != 0) {
             revert TickSpacingMisaligned(config.gridSpacing, key.tickSpacing, key.tickSpacing);
         }
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.DEPLOY_GRID), abi.encode(key, totalLiquidity)));
+        poolManager.unlock(abi.encode(uint8(UnlockAction.DEPLOY_GRID), abi.encode(msg.sender, key, totalLiquidity)));
     }
 
-    function rebalance(PoolKey calldata key) external {
+    function rebalance(
+        PoolKey calldata key,
+        address user
+    ) external {
         PoolId poolId = key.toId();
-        _requireConfigured(poolId);
+        _requireUserConfigured(poolId, user);
 
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        if (!state.gridDeployed) revert GridNotDeployed(poolId);
+        GridTypes.UserGridState storage userState = _userStates[user][poolId];
+        if (!userState.deployed) revert GridNotDeployed(poolId, user);
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(key)));
+        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key)));
     }
 
-    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+    function closeGrid(
+        PoolKey calldata key
+    ) external {
+        PoolId poolId = key.toId();
+
+        GridTypes.UserGridState storage userState = _userStates[msg.sender][poolId];
+        if (!userState.deployed) revert GridNotDeployed(poolId, msg.sender);
+
+        poolManager.unlock(abi.encode(uint8(UnlockAction.CLOSE_GRID), abi.encode(msg.sender, key)));
+    }
+
+    function unlockCallback(
+        bytes calldata data
+    ) external override returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
 
         (uint8 action, bytes memory payload) = abi.decode(data, (uint8, bytes));
 
         if (action == uint8(UnlockAction.DEPLOY_GRID)) {
-            (PoolKey memory key, uint128 totalLiquidity) = abi.decode(payload, (PoolKey, uint128));
-            _executeDeploy(key, totalLiquidity);
+            (address user, PoolKey memory key, uint128 totalLiquidity) =
+                abi.decode(payload, (address, PoolKey, uint128));
+            _executeDeploy(user, key, totalLiquidity);
+        } else if (action == uint8(UnlockAction.REBALANCE)) {
+            (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
+            _executeRebalance(user, key);
         } else {
-            PoolKey memory key = abi.decode(payload, (PoolKey));
-            _executeRebalance(key);
+            (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
+            _executeClose(user, key);
         }
 
         return "";
@@ -182,19 +222,19 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
 
     // --- Utility ---
 
-    function computePositionKey(address owner, int24 tickLower, int24 tickUpper, bytes32 salt)
-        external
-        pure
-        returns (bytes32)
-    {
+    function computePositionKey(
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        bytes32 salt
+    ) external pure returns (bytes32) {
         return Position.calculatePositionKey(owner, tickLower, tickUpper, salt);
     }
 
-    function previewWeights(uint256 gridLength, GridTypes.DistributionType distributionType)
-        external
-        pure
-        returns (uint256[] memory)
-    {
+    function previewWeights(
+        uint256 gridLength,
+        GridTypes.DistributionType distributionType
+    ) external pure returns (uint256[] memory) {
         return DistributionWeights.getWeights(gridLength, distributionType);
     }
 
@@ -233,209 +273,212 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
             | Hooks.AFTER_SWAP_FLAG;
     }
 
-    function beforeInitialize(address, PoolKey calldata, uint160) external pure override returns (bytes4) {
+    // --- Hook Callbacks ---
+
+    function beforeInitialize(
+        address,
+        PoolKey calldata,
+        uint160
+    ) external pure override returns (bytes4) {
         return IHooks.beforeInitialize.selector;
     }
 
-    function afterInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96, int24 tick)
-        external
-        override
-        onlyPoolManager
-        returns (bytes4)
-    {
+    function afterInitialize(
+        address,
+        PoolKey calldata key,
+        uint160 sqrtPriceX96,
+        int24 tick
+    ) external override onlyPoolManager returns (bytes4) {
         PoolId poolId = key.toId();
-        _requireConfigured(poolId);
 
-        GridTypes.GridConfig storage config = _poolConfigs[poolId];
-        _plannedWeights[poolId] = DistributionWeights.getWeights(config.maxOrders, config.distributionType);
-
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        state.initialized = true;
-        state.currentTick = tick;
-        state.gridCenterTick = _alignTick(tick, key.tickSpacing);
+        GridTypes.PoolState storage pool = _poolStates[poolId];
+        pool.initialized = true;
+        pool.currentTick = tick;
 
         emit PoolInitialized(poolId, sqrtPriceX96, tick);
-        emit PoolInitializationPlanned(poolId, config.maxOrders, config.distributionType);
         return IHooks.afterInitialize.selector;
     }
 
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        override
-        returns (bytes4)
-    {
+    function beforeAddLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external pure override returns (bytes4) {
         return IHooks.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(
         address,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
         BalanceDelta,
         BalanceDelta,
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
-        PoolId poolId = key.toId();
-        _requireConfigured(poolId);
-
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        state.liquidityOperations += 1;
-        state.lastLowerTick = params.tickLower;
-        state.lastUpperTick = params.tickUpper;
-
-        emit LiquidityObserved(poolId, true, params.tickLower, params.tickUpper, params.liquidityDelta, params.salt);
         return (IHooks.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        override
-        returns (bytes4)
-    {
+    function beforeRemoveLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external pure override returns (bytes4) {
         return IHooks.beforeRemoveLiquidity.selector;
     }
 
     function afterRemoveLiquidity(
         address,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
         BalanceDelta,
         BalanceDelta,
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
-        PoolId poolId = key.toId();
-        _requireConfigured(poolId);
-
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        state.liquidityOperations += 1;
-        state.lastLowerTick = params.tickLower;
-        state.lastUpperTick = params.tickUpper;
-
-        emit LiquidityObserved(poolId, false, params.tickLower, params.tickUpper, params.liquidityDelta, params.salt);
         return (IHooks.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
-    function beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
-        external
-        pure
-        override
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
+    function beforeSwap(
+        address,
+        PoolKey calldata,
+        SwapParams calldata,
+        bytes calldata
+    ) external pure override returns (bytes4, BeforeSwapDelta, uint24) {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta, bytes calldata)
-        external
-        override
-        onlyPoolManager
-        returns (bytes4, int128)
-    {
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, int128) {
         PoolId poolId = key.toId();
-        _requireConfigured(poolId);
 
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
-        state.swapCount += 1;
-        state.lastSwapAmountSpecified = params.amountSpecified;
-
+        GridTypes.PoolState storage pool = _poolStates[poolId];
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
-        state.currentTick = currentTick;
-
-        if (state.gridDeployed) {
-            GridTypes.GridConfig storage config = _poolConfigs[poolId];
-            if (config.autoRebalance) {
-                int24 center = state.gridCenterTick;
-                int24 diff = currentTick > center ? currentTick - center : center - currentTick;
-                uint256 deviation = uint256(int256(diff));
-                if (deviation >= uint256(config.rebalanceThresholdBps)) {
-                    emit RebalanceNeeded(poolId, currentTick, center, deviation);
-                }
-            }
-        }
+        pool.currentTick = currentTick;
+        pool.swapCount += 1;
 
         emit SwapObserved(poolId, params.zeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
         return (IHooks.afterSwap.selector, 0);
     }
 
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        external
-        pure
-        override
-        returns (bytes4)
-    {
+    function beforeDonate(
+        address,
+        PoolKey calldata,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
         return IHooks.beforeDonate.selector;
     }
 
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        external
-        pure
-        override
-        returns (bytes4)
-    {
+    function afterDonate(
+        address,
+        PoolKey calldata,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
         return IHooks.afterDonate.selector;
     }
 
     // --- Internal: Unlock Actions ---
 
-    function _executeDeploy(PoolKey memory key, uint128 totalLiquidity) internal {
+    function _executeDeploy(
+        address user,
+        PoolKey memory key,
+        uint128 totalLiquidity
+    ) internal {
         PoolId poolId = key.toId();
-        GridTypes.GridConfig storage config = _poolConfigs[poolId];
-        GridTypes.PoolRuntimeState storage state = _poolStates[poolId];
+        GridTypes.PoolState storage pool = _poolStates[poolId];
 
-        int24 centerTick = state.gridCenterTick;
+        int24 centerTick = _alignTick(pool.currentTick, key.tickSpacing);
 
-        GridTypes.GridOrder[] memory orders = _computeGridOrders(
-            centerTick, config.gridSpacing, key.tickSpacing, config.maxOrders, _plannedWeights[poolId], totalLiquidity
-        );
+        delete _userOrders[user][poolId];
 
-        delete _gridOrders[poolId];
+        (int128 totalDelta0, int128 totalDelta1) = _placeNewOrders(key, user, poolId, centerTick, totalLiquidity);
 
-        (int128 totalDelta0, int128 totalDelta1) = _placeOrders(key, poolId, orders);
+        _settleForUser(key, user, totalDelta0, totalDelta1);
 
-        _settleDeltas(key, totalDelta0, totalDelta1);
+        _userStates[user][poolId].deployed = true;
+        _userStates[user][poolId].gridCenterTick = centerTick;
 
-        state.gridDeployed = true;
-        emit GridDeployed(poolId, config.maxOrders, totalLiquidity);
+        GridTypes.GridConfig storage config = _userConfigs[user][poolId];
+        emit GridDeployed(poolId, user, config.maxOrders, totalLiquidity);
     }
 
-    function _executeRebalance(PoolKey memory key) internal {
+    function _executeRebalance(
+        address user,
+        PoolKey memory key
+    ) internal {
         PoolId poolId = key.toId();
 
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
-        int24 oldCenter = _poolStates[poolId].gridCenterTick;
+        int24 oldCenter = _userStates[user][poolId].gridCenterTick;
 
-        (int128 removeDelta0, int128 removeDelta1, uint128 totalLiquidity) = _removeAllOrders(key, poolId);
-        delete _gridOrders[poolId];
+        (int128 removeDelta0, int128 removeDelta1, uint128 totalLiquidity) = _removeAllOrders(key, user, poolId);
+        delete _userOrders[user][poolId];
 
         int24 newCenter = _alignTick(currentTick, key.tickSpacing);
-        (int128 addDelta0, int128 addDelta1) = _rebalancePlaceNewOrders(key, poolId, newCenter, totalLiquidity);
 
-        _settleDeltas(key, removeDelta0 + addDelta0, removeDelta1 + addDelta1);
+        (int128 addDelta0, int128 addDelta1) = _placeNewOrders(key, user, poolId, newCenter, totalLiquidity);
 
-        _poolStates[poolId].gridCenterTick = newCenter;
-        _poolStates[poolId].currentTick = currentTick;
+        _settleForUser(key, user, removeDelta0 + addDelta0, removeDelta1 + addDelta1);
 
-        emit GridRebalanced(poolId, oldCenter, newCenter);
+        _userStates[user][poolId].gridCenterTick = newCenter;
+
+        emit GridRebalanced(poolId, user, oldCenter, newCenter);
     }
 
-    function _rebalancePlaceNewOrders(PoolKey memory key, PoolId poolId, int24 newCenter, uint128 totalLiquidity)
-        internal
-        returns (int128, int128)
-    {
-        GridTypes.GridConfig storage config = _poolConfigs[poolId];
-        GridTypes.GridOrder[] memory newOrders = _computeGridOrders(
-            newCenter, config.gridSpacing, key.tickSpacing, config.maxOrders, _plannedWeights[poolId], totalLiquidity
+    function _placeNewOrders(
+        PoolKey memory key,
+        address user,
+        PoolId poolId,
+        int24 centerTick,
+        uint128 totalLiquidity
+    ) internal returns (int128, int128) {
+        GridTypes.GridConfig storage config = _userConfigs[user][poolId];
+        GridTypes.GridOrder[] memory orders = _computeGridOrders(
+            centerTick,
+            config.gridSpacing,
+            key.tickSpacing,
+            config.maxOrders,
+            _userWeights[user][poolId],
+            totalLiquidity
         );
-        return _placeOrders(key, poolId, newOrders);
+        return _placeOrders(key, user, poolId, orders);
     }
 
-    function _removeAllOrders(PoolKey memory key, PoolId poolId)
-        internal
-        returns (int128 totalDelta0, int128 totalDelta1, uint128 totalLiquidity)
-    {
-        GridTypes.GridOrder[] storage existingOrders = _gridOrders[poolId];
+    function _executeClose(
+        address user,
+        PoolKey memory key
+    ) internal {
+        PoolId poolId = key.toId();
+
+        (int128 removeDelta0, int128 removeDelta1,) = _removeAllOrders(key, user, poolId);
+        delete _userOrders[user][poolId];
+
+        _settleForUser(key, user, removeDelta0, removeDelta1);
+
+        _userStates[user][poolId].deployed = false;
+        _userStates[user][poolId].gridCenterTick = 0;
+
+        emit GridClosed(poolId, user);
+    }
+
+    function _removeAllOrders(
+        PoolKey memory key,
+        address user,
+        PoolId poolId
+    ) internal returns (int128 totalDelta0, int128 totalDelta1, uint128 totalLiquidity) {
+        GridTypes.GridOrder[] storage existingOrders = _userOrders[user][poolId];
         uint256 orderCount = existingOrders.length;
+
+        bytes32 userSalt = bytes32(uint256(uint160(user)));
 
         for (uint256 i; i < orderCount; ++i) {
             GridTypes.GridOrder storage order = existingOrders[i];
@@ -447,7 +490,7 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
                     tickLower: order.tickLower,
                     tickUpper: order.tickUpper,
                     liquidityDelta: -int256(uint256(order.liquidity)),
-                    salt: bytes32(uint256(i))
+                    salt: keccak256(abi.encodePacked(userSalt, i))
                 }),
                 ""
             );
@@ -457,12 +500,16 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
         }
     }
 
-    function _placeOrders(PoolKey memory key, PoolId poolId, GridTypes.GridOrder[] memory orders)
-        internal
-        returns (int128 totalDelta0, int128 totalDelta1)
-    {
+    function _placeOrders(
+        PoolKey memory key,
+        address user,
+        PoolId poolId,
+        GridTypes.GridOrder[] memory orders
+    ) internal returns (int128 totalDelta0, int128 totalDelta1) {
+        bytes32 userSalt = bytes32(uint256(uint160(user)));
+
         for (uint256 i; i < orders.length; ++i) {
-            _gridOrders[poolId].push(orders[i]);
+            _userOrders[user][poolId].push(orders[i]);
 
             (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
                 key,
@@ -470,7 +517,7 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
                     tickLower: orders[i].tickLower,
                     tickUpper: orders[i].tickUpper,
                     liquidityDelta: int256(uint256(orders[i].liquidity)),
-                    salt: bytes32(uint256(i))
+                    salt: keccak256(abi.encodePacked(userSalt, i))
                 }),
                 ""
             );
@@ -482,21 +529,32 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
 
     // --- Internal: Settlement ---
 
-    function _settleDeltas(PoolKey memory key, int128 delta0, int128 delta1) internal {
-        if (delta0 < 0) {
-            poolManager.sync(key.currency0);
-            key.currency0.transfer(address(poolManager), uint256(uint128(-delta0)));
-            poolManager.settle();
-        } else if (delta0 > 0) {
-            poolManager.take(key.currency0, address(this), uint256(uint128(delta0)));
-        }
+    function _settleForUser(
+        PoolKey memory key,
+        address user,
+        int128 delta0,
+        int128 delta1
+    ) internal {
+        _settleCurrency(key.currency0, user, delta0);
+        _settleCurrency(key.currency1, user, delta1);
+    }
 
-        if (delta1 < 0) {
-            poolManager.sync(key.currency1);
-            key.currency1.transfer(address(poolManager), uint256(uint128(-delta1)));
+    function _settleCurrency(
+        Currency currency,
+        address user,
+        int128 delta
+    ) internal {
+        if (delta < 0) {
+            // casting is safe: delta < 0 so -delta is positive and fits uint128; uint256 widening is lossless
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 amount = uint256(uint128(-delta));
+            poolManager.sync(currency);
+            IERC20(Currency.unwrap(currency)).safeTransferFrom(user, address(poolManager), amount);
             poolManager.settle();
-        } else if (delta1 > 0) {
-            poolManager.take(key.currency1, address(this), uint256(uint128(delta1)));
+        } else if (delta > 0) {
+            // casting is safe: delta > 0 so positive int128 fits uint128; uint256 widening is lossless
+            // forge-lint: disable-next-line(unsafe-typecast)
+            poolManager.take(currency, user, uint256(uint128(delta)));
         }
     }
 
@@ -512,26 +570,36 @@ contract GridHook is IHooks, IUnlockCallback, Ownable {
     ) internal pure returns (GridTypes.GridOrder[] memory orders) {
         orders = new GridTypes.GridOrder[](maxOrders);
 
+        // casting is safe: maxOrders <= MAX_GRID_ORDERS (1000), so maxOrders/2 <= 500 which fits int24
+        // forge-lint: disable-next-line(unsafe-typecast)
         int24 halfOrders = int24(uint24(maxOrders / 2));
         int24 bottomTick = _alignTick(centerTick - (halfOrders * gridSpacing), tickSpacing);
 
         for (uint256 i; i < maxOrders; ++i) {
+            // casting is safe: i < maxOrders <= 1000, fits int256 and int24
+            // forge-lint: disable-next-line(unsafe-typecast)
             int24 tickLower = bottomTick + int24(int256(i)) * gridSpacing;
             int24 tickUpper = tickLower + gridSpacing;
 
             uint128 liquidity = uint128((uint256(totalLiquidity) * weights[i]) / 10_000);
 
-            orders[i] = GridTypes.GridOrder({tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity});
+            orders[i] = GridTypes.GridOrder({ tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity });
         }
     }
 
-    function _alignTick(int24 tick, int24 tickSpacing) internal pure returns (int24) {
+    function _alignTick(
+        int24 tick,
+        int24 tickSpacing
+    ) internal pure returns (int24) {
         int24 compressed = tick / tickSpacing;
         if (tick < 0 && tick % tickSpacing != 0) compressed--;
         return compressed * tickSpacing;
     }
 
-    function _requireConfigured(PoolId poolId) private view {
-        if (_poolConfigs[poolId].maxOrders == 0) revert PoolNotConfigured(poolId);
+    function _requireUserConfigured(
+        PoolId poolId,
+        address user
+    ) private view {
+        if (_userConfigs[user][poolId].maxOrders == 0) revert GridNotConfigured(poolId, user);
     }
 }

@@ -1,49 +1,63 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test, Vm} from "forge-std/Test.sol";
+import { Test, Vm } from "forge-std/Test.sol";
 
-import {GridHook} from "src/hooks/GridHook.sol";
-import {GridTypes} from "src/libraries/GridTypes.sol";
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {Currency} from "v4-core/types/Currency.sol";
-import {IHooks} from "v4-core/interfaces/IHooks.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
-import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
+import { GridHook } from "src/hooks/GridHook.sol";
+import { GridTypes } from "src/libraries/GridTypes.sol";
+import { Hooks } from "v4-core/libraries/Hooks.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
+import { Currency } from "v4-core/types/Currency.sol";
+import { IHooks } from "v4-core/interfaces/IHooks.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import { BalanceDelta } from "v4-core/types/BalanceDelta.sol";
+import { ModifyLiquidityParams, SwapParams } from "v4-core/types/PoolOperation.sol";
 
 contract MockPoolManager {
     mapping(bytes32 => bytes32) private _extsloadData;
 
-    function extsload(bytes32 slot) external view returns (bytes32) {
+    function extsload(
+        bytes32 slot
+    ) external view returns (bytes32) {
         return _extsloadData[slot];
     }
 
-    function setExtsloadData(bytes32 slot, bytes32 value) external {
+    function setExtsloadData(
+        bytes32 slot,
+        bytes32 value
+    ) external {
         _extsloadData[slot] = value;
     }
 
-    function unlock(bytes calldata data) external returns (bytes memory) {
+    function unlock(
+        bytes calldata data
+    ) external returns (bytes memory) {
         return IUnlockCallback(msg.sender).unlockCallback(data);
     }
 
-    function modifyLiquidity(PoolKey memory, ModifyLiquidityParams memory, bytes calldata)
-        external
-        returns (BalanceDelta, BalanceDelta)
-    {
+    function modifyLiquidity(
+        PoolKey memory,
+        ModifyLiquidityParams memory,
+        bytes calldata
+    ) external returns (BalanceDelta, BalanceDelta) {
         return (BalanceDelta.wrap(0), BalanceDelta.wrap(0));
     }
 
-    function sync(Currency) external {}
+    function sync(
+        Currency
+    ) external { }
 
     function settle() external payable returns (uint256) {
         return 0;
     }
 
-    function take(Currency, address, uint256) external {}
+    function take(
+        Currency,
+        address,
+        uint256
+    ) external { }
 }
 
 contract GridHookTest is Test {
@@ -52,9 +66,12 @@ contract GridHookTest is Test {
     GridHook internal hook;
     MockPoolManager internal mockPm;
 
+    address internal alice = makeAddr("alice");
+    address internal bob = makeAddr("bob");
+
     function setUp() external {
         mockPm = new MockPoolManager();
-        hook = new GridHook(IPoolManager(address(mockPm)), address(this));
+        hook = new GridHook(IPoolManager(address(mockPm)));
     }
 
     // ==================== Permissions ====================
@@ -83,12 +100,12 @@ contract GridHookTest is Test {
 
     // ==================== Configuration ====================
 
-    function testSetPoolConfigAndReadBack() external {
+    function testSetGridConfigAndReadBack() external {
         PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
 
-        hook.setPoolConfig(key, config);
-        GridTypes.GridConfig memory stored = hook.getPoolConfig(key);
+        hook.setGridConfig(key, config);
+        GridTypes.GridConfig memory stored = hook.getGridConfig(key, address(this));
 
         assertEq(stored.gridSpacing, config.gridSpacing);
         assertEq(stored.maxOrders, config.maxOrders);
@@ -97,40 +114,93 @@ contract GridHookTest is Test {
         assertEq(stored.autoRebalance, config.autoRebalance);
     }
 
-    function testSetPoolConfigRevertsForInvalidGridSpacing() external {
+    function testSetGridConfigStoresWeights() external {
+        PoolKey memory key = _poolKey();
+        GridTypes.GridConfig memory config = _defaultConfig();
+
+        hook.setGridConfig(key, config);
+        uint256[] memory weights = hook.getPlannedWeights(key, address(this));
+
+        assertEq(weights.length, config.maxOrders);
+        // Fibonacci(5): [833, 833, 1666, 2500, 4166]
+        assertEq(weights[0], 833);
+        assertEq(weights[1], 833);
+        assertEq(weights[2], 1666);
+        assertEq(weights[3], 2500);
+        assertEq(weights[4], 4166);
+    }
+
+    function testSetGridConfigRevertsForInvalidGridSpacing() external {
         PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
         config.gridSpacing = 0;
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.InvalidGridStep.selector, 0));
-        hook.setPoolConfig(key, config);
+        hook.setGridConfig(key, config);
     }
 
-    function testSetPoolConfigRevertsForInvalidMaxOrders() external {
+    function testSetGridConfigRevertsForInvalidMaxOrders() external {
         PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
 
         config.maxOrders = 0;
         vm.expectRevert(abi.encodeWithSelector(GridHook.InvalidGridQuantity.selector, 0));
-        hook.setPoolConfig(key, config);
+        hook.setGridConfig(key, config);
 
-        config.maxOrders = 1_001;
-        vm.expectRevert(abi.encodeWithSelector(GridHook.InvalidGridQuantity.selector, 1_001));
-        hook.setPoolConfig(key, config);
+        config.maxOrders = 1001;
+        vm.expectRevert(abi.encodeWithSelector(GridHook.InvalidGridQuantity.selector, 1001));
+        hook.setGridConfig(key, config);
     }
 
-    function testSetPoolConfigRevertsForInvalidRebalanceThreshold() external {
+    function testSetGridConfigRevertsForInvalidRebalanceThreshold() external {
         PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
         config.rebalanceThresholdBps = 501;
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.SlippageTooHigh.selector, 501));
-        hook.setPoolConfig(key, config);
+        hook.setGridConfig(key, config);
     }
 
     function testConstructorRevertsForZeroPoolManager() external {
-        vm.expectRevert(GridHook.PositionManagerAddressZero.selector);
-        new GridHook(IPoolManager(address(0)), address(this));
+        vm.expectRevert(GridHook.PoolManagerAddressZero.selector);
+        new GridHook(IPoolManager(address(0)));
+    }
+
+    // ==================== Multi-User Config Isolation ====================
+
+    function testTwoUsersCanConfigureSamePool() external {
+        PoolKey memory key = _poolKey();
+
+        GridTypes.GridConfig memory fibConfig = _defaultConfig();
+
+        GridTypes.GridConfig memory flatConfig = GridTypes.GridConfig({
+            gridSpacing: 60,
+            maxOrders: 4,
+            rebalanceThresholdBps: 100,
+            distributionType: GridTypes.DistributionType.FLAT,
+            autoRebalance: false
+        });
+
+        vm.prank(alice);
+        hook.setGridConfig(key, fibConfig);
+
+        vm.prank(bob);
+        hook.setGridConfig(key, flatConfig);
+
+        GridTypes.GridConfig memory aliceStored = hook.getGridConfig(key, alice);
+        GridTypes.GridConfig memory bobStored = hook.getGridConfig(key, bob);
+
+        assertEq(aliceStored.maxOrders, 5);
+        assertEq(uint256(aliceStored.distributionType), uint256(GridTypes.DistributionType.FIBONACCI));
+
+        assertEq(bobStored.maxOrders, 4);
+        assertEq(uint256(bobStored.distributionType), uint256(GridTypes.DistributionType.FLAT));
+
+        uint256[] memory aliceWeights = hook.getPlannedWeights(key, alice);
+        uint256[] memory bobWeights = hook.getPlannedWeights(key, bob);
+        assertEq(aliceWeights.length, 5);
+        assertEq(bobWeights.length, 4);
+        assertEq(bobWeights[0], 2500);
     }
 
     // ==================== Callback Gating ====================
@@ -140,62 +210,25 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), _poolKey(), 1, 0);
     }
 
-    function testAfterInitializeRevertsWhenPoolNotConfigured() external {
-        PoolKey memory key = _poolKey();
-
-        vm.prank(address(mockPm));
-        vm.expectRevert(abi.encodeWithSelector(GridHook.PoolNotConfigured.selector, key.toId()));
-        hook.afterInitialize(address(this), key, 1, 0);
+    function testAfterSwapRevertsWhenNotPoolManager() external {
+        SwapParams memory params = SwapParams({ zeroForOne: true, amountSpecified: -100, sqrtPriceLimitX96: 0 });
+        vm.expectRevert(GridHook.NotPoolManager.selector);
+        hook.afterSwap(address(this), _poolKey(), params, BalanceDelta.wrap(0), bytes(""));
     }
 
     // ==================== After Initialize ====================
 
-    function testAfterInitializeStoresPlannedWeights() external {
+    function testAfterInitializeSetsPoolState() external {
         PoolKey memory key = _poolKey();
-        GridTypes.GridConfig memory config = _defaultConfig();
-
-        hook.setPoolConfig(key, config);
-
-        vm.prank(address(mockPm));
-        hook.afterInitialize(address(this), key, 1, 0);
-
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
-        uint256[] memory plannedWeights = hook.getPlannedWeights(key);
-
-        assertTrue(state.initialized);
-        assertEq(plannedWeights.length, config.maxOrders);
-        assertEq(plannedWeights[0], 833);
-        assertEq(plannedWeights[1], 833);
-        assertEq(plannedWeights[2], 1666);
-        assertEq(plannedWeights[3], 2500);
-        assertEq(plannedWeights[4], 4166);
-    }
-
-    function testAfterInitializeStoresCurrentTick() external {
-        PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 120);
 
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
+        GridTypes.PoolState memory state = hook.getPoolState(key);
 
+        assertTrue(state.initialized);
         assertEq(state.currentTick, 120);
-        assertEq(state.gridCenterTick, 120);
-        assertFalse(state.gridDeployed);
-    }
-
-    function testAfterInitializeAlignsCenterTick() external {
-        PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
-
-        vm.prank(address(mockPm));
-        hook.afterInitialize(address(this), key, 1 << 96, 85);
-
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
-
-        assertEq(state.currentTick, 85);
-        assertEq(state.gridCenterTick, 60); // aligned down to tickSpacing=60
+        assertEq(state.swapCount, 0);
     }
 
     // ==================== Weight Previews ====================
@@ -248,7 +281,6 @@ contract GridHookTest is Test {
         GridTypes.GridOrder[] memory orders = hook.computeGridOrders(0, 60, 60, 5, weights, 1_000_000);
 
         assertEq(orders.length, 5);
-        // halfOrders = 5/2 = 2, bottomTick = 0 - 2*60 = -120
         assertEq(orders[0].tickLower, -120);
         assertEq(orders[0].tickUpper, -60);
         assertEq(orders[1].tickLower, -60);
@@ -263,10 +295,9 @@ contract GridHookTest is Test {
 
     function testComputeGridOrdersLiquidityDistribution() external view {
         uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.LINEAR);
-        // weights = [1000, 2000, 3000, 4000]
         GridTypes.GridOrder[] memory orders = hook.computeGridOrders(0, 60, 60, 4, weights, 100_000);
 
-        assertEq(orders[0].liquidity, 10_000); // 100000 * 1000 / 10000
+        assertEq(orders[0].liquidity, 10_000);
         assertEq(orders[1].liquidity, 20_000);
         assertEq(orders[2].liquidity, 30_000);
         assertEq(orders[3].liquidity, 40_000);
@@ -286,7 +317,6 @@ contract GridHookTest is Test {
         uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.FLAT);
         GridTypes.GridOrder[] memory orders = hook.computeGridOrders(-180, 60, 60, 4, weights, 40_000);
 
-        // halfOrders = 2, bottomTick = -180 - 2*60 = -300
         assertEq(orders[0].tickLower, -300);
         assertEq(orders[0].tickUpper, -240);
         assertEq(orders[3].tickLower, -120);
@@ -306,54 +336,18 @@ contract GridHookTest is Test {
         assertEq(computed, expected);
     }
 
-    // ==================== Liquidity & Swap Callbacks ====================
-
-    function testAfterLiquidityAndSwapUpdateRuntimeState() external {
-        PoolKey memory key = _poolKey();
-        GridTypes.GridConfig memory config = _defaultConfig();
-        hook.setPoolConfig(key, config);
-
-        vm.prank(address(mockPm));
-        hook.afterInitialize(address(this), key, 1, 0);
-
-        ModifyLiquidityParams memory liquidityParams = ModifyLiquidityParams({
-            tickLower: -120,
-            tickUpper: 120,
-            liquidityDelta: 10,
-            salt: bytes32(0)
-        });
-
-        vm.prank(address(mockPm));
-        hook.afterAddLiquidity(
-            address(this), key, liquidityParams, BalanceDelta.wrap(0), BalanceDelta.wrap(0), bytes("")
-        );
-
-        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1234, sqrtPriceLimitX96: 0});
-
-        vm.prank(address(mockPm));
-        hook.afterSwap(address(this), key, swapParams, BalanceDelta.wrap(0), bytes(""));
-
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
-
-        assertEq(state.liquidityOperations, 1);
-        assertEq(state.swapCount, 1);
-        assertEq(state.lastLowerTick, -120);
-        assertEq(state.lastUpperTick, 120);
-        assertEq(state.lastSwapAmountSpecified, -1234);
-    }
-
     // ==================== Deploy Grid ====================
 
     function testDeployGridCreatesOrders() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         hook.deployGrid(key, 1_000_000);
 
-        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key);
+        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 5);
 
         // Fibonacci weights [833, 833, 1666, 2500, 4166]
@@ -363,19 +357,19 @@ contract GridHookTest is Test {
         assertEq(orders[3].liquidity, 250_000);
         assertEq(orders[4].liquidity, 416_600);
 
-        // Check tick ranges centered on 0 with gridSpacing=60
         assertEq(orders[0].tickLower, -120);
         assertEq(orders[0].tickUpper, -60);
         assertEq(orders[4].tickLower, 120);
         assertEq(orders[4].tickUpper, 180);
 
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
-        assertTrue(state.gridDeployed);
+        GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
+        assertTrue(userState.deployed);
+        assertEq(userState.gridCenterTick, 0);
     }
 
     function testDeployGridRevertsWhenNotInitialized() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.PoolNotInitialized.selector, key.toId()));
         hook.deployGrid(key, 1_000_000);
@@ -383,20 +377,20 @@ contract GridHookTest is Test {
 
     function testDeployGridRevertsWhenAlreadyDeployed() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         hook.deployGrid(key, 1_000_000);
 
-        vm.expectRevert(abi.encodeWithSelector(GridHook.GridAlreadyDeployed.selector, key.toId()));
+        vm.expectRevert(abi.encodeWithSelector(GridHook.GridAlreadyDeployed.selector, key.toId(), address(this)));
         hook.deployGrid(key, 1_000_000);
     }
 
     function testDeployGridRevertsWithZeroLiquidity() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
@@ -408,146 +402,239 @@ contract GridHookTest is Test {
     function testDeployGridRevertsWhenNotConfigured() external {
         PoolKey memory key = _poolKey();
 
-        vm.expectRevert(abi.encodeWithSelector(GridHook.PoolNotConfigured.selector, key.toId()));
+        vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotConfigured.selector, key.toId(), address(this)));
         hook.deployGrid(key, 1_000_000);
     }
 
     function testDeployGridRevertsWhenSpacingMisaligned() external {
-        PoolKey memory key = _poolKey(); // tickSpacing=60
+        PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
-        config.gridSpacing = 50; // not a multiple of 60
-        hook.setPoolConfig(key, config);
+        config.gridSpacing = 50;
+        hook.setGridConfig(key, config);
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        vm.expectRevert(abi.encodeWithSelector(GridHook.TickSpacingMisaligned.selector, int24(50), int24(60), int24(60)));
+        vm.expectRevert(
+            abi.encodeWithSelector(GridHook.TickSpacingMisaligned.selector, int24(50), int24(60), int24(60))
+        );
         hook.deployGrid(key, 1_000_000);
+    }
+
+    // ==================== Multi-User Deploy ====================
+
+    function testTwoUsersDeployOnSamePool() external {
+        PoolKey memory key = _poolKey();
+
+        vm.prank(alice);
+        hook.setGridConfig(key, _defaultConfig());
+
+        GridTypes.GridConfig memory flatConfig = GridTypes.GridConfig({
+            gridSpacing: 60,
+            maxOrders: 4,
+            rebalanceThresholdBps: 100,
+            distributionType: GridTypes.DistributionType.FLAT,
+            autoRebalance: false
+        });
+        vm.prank(bob);
+        hook.setGridConfig(key, flatConfig);
+
+        vm.prank(address(mockPm));
+        hook.afterInitialize(address(this), key, 1 << 96, 0);
+
+        vm.prank(alice);
+        hook.deployGrid(key, 1_000_000);
+
+        vm.prank(bob);
+        hook.deployGrid(key, 400_000);
+
+        GridTypes.GridOrder[] memory aliceOrders = hook.getGridOrders(key, alice);
+        GridTypes.GridOrder[] memory bobOrders = hook.getGridOrders(key, bob);
+
+        assertEq(aliceOrders.length, 5);
+        assertEq(bobOrders.length, 4);
+
+        assertEq(aliceOrders[0].liquidity, 83_300);
+        assertEq(aliceOrders[4].liquidity, 416_600);
+
+        assertEq(bobOrders[0].liquidity, 100_000);
+        assertEq(bobOrders[1].liquidity, 100_000);
+        assertEq(bobOrders[2].liquidity, 100_000);
+        assertEq(bobOrders[3].liquidity, 100_000);
+
+        assertTrue(hook.getUserState(key, alice).deployed);
+        assertTrue(hook.getUserState(key, bob).deployed);
     }
 
     // ==================== Rebalance ====================
 
     function testRebalanceUpdatesGridCenter() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         hook.deployGrid(key, 1_000_000);
 
-        // Simulate price moving to tick 300 by setting mock slot0
         _setMockSlot0(key, 300);
 
-        hook.rebalance(key);
+        hook.rebalance(key, address(this));
 
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
-        assertEq(state.gridCenterTick, 300); // aligned: 300 / 60 * 60 = 300
-        assertEq(state.currentTick, 300);
+        GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
+        assertEq(userState.gridCenterTick, 300);
 
-        // Verify new orders are centered on 300
-        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key);
+        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 5);
-        // halfOrders=2, bottomTick = 300 - 2*60 = 180
         assertEq(orders[0].tickLower, 180);
         assertEq(orders[0].tickUpper, 240);
         assertEq(orders[4].tickLower, 420);
         assertEq(orders[4].tickUpper, 480);
     }
 
-    function testRebalanceRevertsWhenGridNotDeployed() external {
+    function testRebalanceByKeeperSucceeds() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
-
-        vm.prank(address(mockPm));
-        hook.afterInitialize(address(this), key, 1 << 96, 0);
-
-        vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotDeployed.selector, key.toId()));
-        hook.rebalance(key);
-    }
-
-    // ==================== Swap + Rebalance Detection ====================
-
-    function testAfterSwapEmitsRebalanceNeededWhenDeviationExceedsThreshold() external {
-        PoolKey memory key = _poolKey();
-        GridTypes.GridConfig memory config = _defaultConfig();
-        config.rebalanceThresholdBps = 250;
-        config.autoRebalance = true;
-        hook.setPoolConfig(key, config);
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         hook.deployGrid(key, 1_000_000);
 
-        // Simulate post-swap tick at 300 (deviation=300 > threshold=250)
         _setMockSlot0(key, 300);
 
-        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -100, sqrtPriceLimitX96: 0});
+        vm.prank(alice);
+        hook.rebalance(key, address(this));
 
-        vm.expectEmit(true, false, false, true);
-        emit GridHook.RebalanceNeeded(key.toId(), int24(300), int24(0), 300);
-
-        vm.prank(address(mockPm));
-        hook.afterSwap(address(this), key, swapParams, BalanceDelta.wrap(0), bytes(""));
+        GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
+        assertEq(userState.gridCenterTick, 300);
     }
 
-    function testAfterSwapNoRebalanceWhenDeviationBelowThreshold() external {
+    function testRebalanceRevertsWhenGridNotDeployed() external {
         PoolKey memory key = _poolKey();
-        GridTypes.GridConfig memory config = _defaultConfig();
-        config.rebalanceThresholdBps = 250;
-        config.autoRebalance = true;
-        hook.setPoolConfig(key, config);
+        hook.setGridConfig(key, _defaultConfig());
+
+        vm.prank(address(mockPm));
+        hook.afterInitialize(address(this), key, 1 << 96, 0);
+
+        vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotDeployed.selector, key.toId(), address(this)));
+        hook.rebalance(key, address(this));
+    }
+
+    function testRebalanceDoesNotAffectOtherUser() external {
+        PoolKey memory key = _poolKey();
+
+        vm.prank(alice);
+        hook.setGridConfig(key, _defaultConfig());
+
+        vm.prank(bob);
+        hook.setGridConfig(key, _defaultConfig());
+
+        vm.prank(address(mockPm));
+        hook.afterInitialize(address(this), key, 1 << 96, 0);
+
+        vm.prank(alice);
+        hook.deployGrid(key, 1_000_000);
+
+        vm.prank(bob);
+        hook.deployGrid(key, 500_000);
+
+        _setMockSlot0(key, 300);
+        hook.rebalance(key, alice);
+
+        assertEq(hook.getUserState(key, alice).gridCenterTick, 300);
+        assertEq(hook.getUserState(key, bob).gridCenterTick, 0);
+
+        GridTypes.GridOrder[] memory bobOrders = hook.getGridOrders(key, bob);
+        assertEq(bobOrders[0].tickLower, -120);
+    }
+
+    // ==================== Close Grid ====================
+
+    function testCloseGridRemovesOrders() external {
+        PoolKey memory key = _poolKey();
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         hook.deployGrid(key, 1_000_000);
+        assertTrue(hook.getUserState(key, address(this)).deployed);
 
-        // Simulate post-swap tick at 100 (deviation=100 < threshold=250)
-        _setMockSlot0(key, 100);
+        hook.closeGrid(key);
 
-        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -100, sqrtPriceLimitX96: 0});
+        GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
+        assertFalse(userState.deployed);
+        assertEq(userState.gridCenterTick, 0);
 
-        // Record logs and verify no RebalanceNeeded event
-        vm.recordLogs();
-
-        vm.prank(address(mockPm));
-        hook.afterSwap(address(this), key, swapParams, BalanceDelta.wrap(0), bytes(""));
-
-        Vm.Log[] memory entries = vm.getRecordedLogs();
-        for (uint256 i; i < entries.length; ++i) {
-            assertTrue(
-                entries[i].topics[0] != keccak256("RebalanceNeeded(bytes32,int24,int24,uint256)"),
-                "RebalanceNeeded should not be emitted"
-            );
-        }
+        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
+        assertEq(orders.length, 0);
     }
 
-    function testAfterSwapUpdatesCurrentTick() external {
+    function testCloseGridRevertsWhenNotDeployed() external {
         PoolKey memory key = _poolKey();
-        hook.setPoolConfig(key, _defaultConfig());
+
+        vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotDeployed.selector, key.toId(), address(this)));
+        hook.closeGrid(key);
+    }
+
+    function testCloseGridDoesNotAffectOtherUser() external {
+        PoolKey memory key = _poolKey();
+
+        vm.prank(alice);
+        hook.setGridConfig(key, _defaultConfig());
+
+        vm.prank(bob);
+        hook.setGridConfig(key, _defaultConfig());
 
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
+
+        vm.prank(alice);
+        hook.deployGrid(key, 1_000_000);
+
+        vm.prank(bob);
+        hook.deployGrid(key, 500_000);
+
+        vm.prank(alice);
+        hook.closeGrid(key);
+
+        assertFalse(hook.getUserState(key, alice).deployed);
+        assertTrue(hook.getUserState(key, bob).deployed);
+        assertEq(hook.getGridOrders(key, bob).length, 5);
+    }
+
+    // ==================== After Swap ====================
+
+    function testAfterSwapUpdatesPoolState() external {
+        PoolKey memory key = _poolKey();
+
+        vm.prank(address(mockPm));
+        hook.afterInitialize(address(this), key, 1, 0);
 
         _setMockSlot0(key, 180);
 
-        SwapParams memory swapParams = SwapParams({zeroForOne: false, amountSpecified: -500, sqrtPriceLimitX96: 0});
+        SwapParams memory swapParams = SwapParams({ zeroForOne: false, amountSpecified: -500, sqrtPriceLimitX96: 0 });
 
         vm.prank(address(mockPm));
         hook.afterSwap(address(this), key, swapParams, BalanceDelta.wrap(0), bytes(""));
 
-        GridTypes.PoolRuntimeState memory state = hook.getPoolState(key);
+        GridTypes.PoolState memory state = hook.getPoolState(key);
         assertEq(state.currentTick, 180);
+        assertEq(state.swapCount, 1);
     }
 
     // ==================== Helpers ====================
 
-    function _setMockSlot0(PoolKey memory key, int24 tick) internal {
+    function _setMockSlot0(
+        PoolKey memory key,
+        int24 tick
+    ) internal {
         PoolId poolId = key.toId();
         bytes32 stateSlot = keccak256(abi.encodePacked(PoolId.unwrap(poolId), bytes32(uint256(6))));
         uint256 sqrtPriceX96 = 1 << 96;
+        // casting is safe: int24 tick reinterpreted as uint24 then widened to uint256 for bit packing
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint256 packed = sqrtPriceX96 | (uint256(uint24(tick)) << 160);
         mockPm.setExtsloadData(stateSlot, bytes32(packed));
     }
