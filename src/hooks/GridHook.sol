@@ -9,6 +9,7 @@ import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { Position } from "v4-core/libraries/Position.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
+import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { PoolId, PoolIdLibrary } from "v4-core/types/PoolId.sol";
 import { BalanceDelta, BalanceDeltaLibrary } from "v4-core/types/BalanceDelta.sol";
@@ -44,6 +45,9 @@ contract GridHook is IHooks, IUnlockCallback {
     error PoolNotInitialized(PoolId poolId);
     error GridAlreadyDeployed(PoolId poolId, address user);
     error GridNotDeployed(PoolId poolId, address user);
+    error NotAuthorizedRebalancer(address caller, address user);
+    error SlippageExceeded(int128 actual0, int128 actual1, uint128 maxDelta0, uint128 maxDelta1);
+    error TickRangeOutOfBounds(int24 bottomTick, int24 topTick);
 
     event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
 
@@ -65,6 +69,9 @@ contract GridHook is IHooks, IUnlockCallback {
 
     IPoolManager public immutable poolManager;
 
+    // Keeper authorization: user => keeper => authorized
+    mapping(address user => mapping(address keeper => bool)) private _rebalanceKeepers;
+
     // Pool-level state (shared across all users)
     mapping(PoolId poolId => GridTypes.PoolState state) private _poolStates;
 
@@ -79,11 +86,22 @@ contract GridHook is IHooks, IUnlockCallback {
     ) {
         if (address(poolManager_) == address(0)) revert PoolManagerAddressZero();
         poolManager = poolManager_;
+        Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         _;
+    }
+
+    // --- Keeper Authorization ---
+
+    function setRebalanceKeeper(address keeper, bool authorized) external {
+        _rebalanceKeepers[msg.sender][keeper] = authorized;
+    }
+
+    function isRebalanceKeeper(address user, address keeper) external view returns (bool) {
+        return _rebalanceKeepers[user][keeper];
     }
 
     // --- Configuration ---
@@ -154,8 +172,10 @@ contract GridHook is IHooks, IUnlockCallback {
 
     function deployGrid(
         PoolKey calldata key,
-        uint128 totalLiquidity
-    ) external {
+        uint128 totalLiquidity,
+        uint128 maxDelta0,
+        uint128 maxDelta1
+    ) external payable {
         PoolId poolId = key.toId();
         _requireUserConfigured(poolId, msg.sender);
 
@@ -171,25 +191,33 @@ contract GridHook is IHooks, IUnlockCallback {
             revert TickSpacingMisaligned(config.gridSpacing, key.tickSpacing, key.tickSpacing);
         }
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.DEPLOY_GRID), abi.encode(msg.sender, key, totalLiquidity)));
+        poolManager.unlock(
+            abi.encode(uint8(UnlockAction.DEPLOY_GRID), abi.encode(msg.sender, key, totalLiquidity, maxDelta0, maxDelta1))
+        );
     }
 
     function rebalance(
         PoolKey calldata key,
-        address user
-    ) external {
+        address user,
+        uint128 maxDelta0,
+        uint128 maxDelta1
+    ) external payable {
+        if (msg.sender != user && !_rebalanceKeepers[user][msg.sender]) {
+            revert NotAuthorizedRebalancer(msg.sender, user);
+        }
+
         PoolId poolId = key.toId();
         _requireUserConfigured(poolId, user);
 
         GridTypes.UserGridState storage userState = _userStates[user][poolId];
         if (!userState.deployed) revert GridNotDeployed(poolId, user);
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key)));
+        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key, maxDelta0, maxDelta1)));
     }
 
     function closeGrid(
         PoolKey calldata key
-    ) external {
+    ) external payable {
         PoolId poolId = key.toId();
 
         GridTypes.UserGridState storage userState = _userStates[msg.sender][poolId];
@@ -206,12 +234,13 @@ contract GridHook is IHooks, IUnlockCallback {
         (uint8 action, bytes memory payload) = abi.decode(data, (uint8, bytes));
 
         if (action == uint8(UnlockAction.DEPLOY_GRID)) {
-            (address user, PoolKey memory key, uint128 totalLiquidity) =
-                abi.decode(payload, (address, PoolKey, uint128));
-            _executeDeploy(user, key, totalLiquidity);
+            (address user, PoolKey memory key, uint128 totalLiquidity, uint128 maxDelta0, uint128 maxDelta1) =
+                abi.decode(payload, (address, PoolKey, uint128, uint128, uint128));
+            _executeDeploy(user, key, totalLiquidity, maxDelta0, maxDelta1);
         } else if (action == uint8(UnlockAction.REBALANCE)) {
-            (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
-            _executeRebalance(user, key);
+            (address user, PoolKey memory key, uint128 maxDelta0, uint128 maxDelta1) =
+                abi.decode(payload, (address, PoolKey, uint128, uint128));
+            _executeRebalance(user, key, maxDelta0, maxDelta1);
         } else {
             (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
             _executeClose(user, key);
@@ -391,7 +420,9 @@ contract GridHook is IHooks, IUnlockCallback {
     function _executeDeploy(
         address user,
         PoolKey memory key,
-        uint128 totalLiquidity
+        uint128 totalLiquidity,
+        uint128 maxDelta0,
+        uint128 maxDelta1
     ) internal {
         PoolId poolId = key.toId();
         GridTypes.PoolState storage pool = _poolStates[poolId];
@@ -402,6 +433,7 @@ contract GridHook is IHooks, IUnlockCallback {
 
         (int128 totalDelta0, int128 totalDelta1) = _placeNewOrders(key, user, poolId, centerTick, totalLiquidity);
 
+        _checkSlippage(totalDelta0, totalDelta1, maxDelta0, maxDelta1);
         _settleForUser(key, user, totalDelta0, totalDelta1);
 
         _userStates[user][poolId].deployed = true;
@@ -413,21 +445,30 @@ contract GridHook is IHooks, IUnlockCallback {
 
     function _executeRebalance(
         address user,
-        PoolKey memory key
+        PoolKey memory key,
+        uint128 maxDelta0,
+        uint128 maxDelta1
     ) internal {
         PoolId poolId = key.toId();
-
-        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
         int24 oldCenter = _userStates[user][poolId].gridCenterTick;
 
         (int128 removeDelta0, int128 removeDelta1, uint128 totalLiquidity) = _removeAllOrders(key, user, poolId);
         delete _userOrders[user][poolId];
 
-        int24 newCenter = _alignTick(currentTick, key.tickSpacing);
+        int24 newCenter;
+        {
+            (, int24 currentTick,,) = poolManager.getSlot0(poolId);
+            newCenter = _alignTick(currentTick, key.tickSpacing);
+        }
 
-        (int128 addDelta0, int128 addDelta1) = _placeNewOrders(key, user, poolId, newCenter, totalLiquidity);
+        {
+            (int128 addDelta0, int128 addDelta1) = _placeNewOrders(key, user, poolId, newCenter, totalLiquidity);
+            removeDelta0 += addDelta0;
+            removeDelta1 += addDelta1;
+        }
 
-        _settleForUser(key, user, removeDelta0 + addDelta0, removeDelta1 + addDelta1);
+        _checkSlippage(removeDelta0, removeDelta1, maxDelta0, maxDelta1);
+        _settleForUser(key, user, removeDelta0, removeDelta1);
 
         _userStates[user][poolId].gridCenterTick = newCenter;
 
@@ -548,9 +589,13 @@ contract GridHook is IHooks, IUnlockCallback {
             // casting is safe: delta < 0 so -delta is positive and fits uint128; uint256 widening is lossless
             // forge-lint: disable-next-line(unsafe-typecast)
             uint256 amount = uint256(uint128(-delta));
-            poolManager.sync(currency);
-            IERC20(Currency.unwrap(currency)).safeTransferFrom(user, address(poolManager), amount);
-            poolManager.settle();
+            if (currency.isAddressZero()) {
+                poolManager.settle{value: amount}();
+            } else {
+                poolManager.sync(currency);
+                IERC20(Currency.unwrap(currency)).safeTransferFrom(user, address(poolManager), amount);
+                poolManager.settle();
+            }
         } else if (delta > 0) {
             // casting is safe: delta > 0 so positive int128 fits uint128; uint256 widening is lossless
             // forge-lint: disable-next-line(unsafe-typecast)
@@ -574,14 +619,28 @@ contract GridHook is IHooks, IUnlockCallback {
         // forge-lint: disable-next-line(unsafe-typecast)
         int24 halfOrders = int24(uint24(maxOrders / 2));
         int24 bottomTick = _alignTick(centerTick - (halfOrders * gridSpacing), tickSpacing);
+        // casting is safe: maxOrders <= 1000 fits int24
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int24 topTick = bottomTick + int24(uint24(maxOrders)) * gridSpacing;
 
+        if (bottomTick < TickMath.MIN_TICK || topTick > TickMath.MAX_TICK) {
+            revert TickRangeOutOfBounds(bottomTick, topTick);
+        }
+
+        uint128 distributed;
         for (uint256 i; i < maxOrders; ++i) {
             // casting is safe: i < maxOrders <= 1000, fits int256 and int24
             // forge-lint: disable-next-line(unsafe-typecast)
             int24 tickLower = bottomTick + int24(int256(i)) * gridSpacing;
             int24 tickUpper = tickLower + gridSpacing;
 
-            uint128 liquidity = uint128((uint256(totalLiquidity) * weights[i]) / 10_000);
+            uint128 liquidity;
+            if (i == maxOrders - 1) {
+                liquidity = totalLiquidity - distributed;
+            } else {
+                liquidity = uint128((uint256(totalLiquidity) * weights[i]) / 10_000);
+                distributed += liquidity;
+            }
 
             orders[i] = GridTypes.GridOrder({ tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity });
         }
@@ -594,6 +653,23 @@ contract GridHook is IHooks, IUnlockCallback {
         int24 compressed = tick / tickSpacing;
         if (tick < 0 && tick % tickSpacing != 0) compressed--;
         return compressed * tickSpacing;
+    }
+
+    function _checkSlippage(
+        int128 delta0,
+        int128 delta1,
+        uint128 maxDelta0,
+        uint128 maxDelta1
+    ) internal pure {
+        // Only enforce when maxDelta > 0 (0 means no limit)
+        if (maxDelta0 > 0 || maxDelta1 > 0) {
+            // Negative deltas = user owes pool; check their absolute value
+            uint128 abs0 = delta0 < 0 ? uint128(-delta0) : uint128(delta0);
+            uint128 abs1 = delta1 < 0 ? uint128(-delta1) : uint128(delta1);
+            if ((maxDelta0 > 0 && abs0 > maxDelta0) || (maxDelta1 > 0 && abs1 > maxDelta1)) {
+                revert SlippageExceeded(delta0, delta1, maxDelta0, maxDelta1);
+            }
+        }
     }
 
     function _requireUserConfigured(

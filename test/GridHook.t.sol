@@ -71,7 +71,19 @@ contract GridHookTest is Test {
 
     function setUp() external {
         mockPm = new MockPoolManager();
-        hook = new GridHook(IPoolManager(address(mockPm)));
+
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_SWAP_FLAG
+        );
+        address hookAddr = address(uint160(type(uint160).max & ~uint160(Hooks.ALL_HOOK_MASK)) | flags);
+
+        deployCodeTo(
+            "GridHook.sol:GridHook",
+            abi.encode(IPoolManager(address(mockPm))),
+            hookAddr
+        );
+        hook = GridHook(hookAddr);
     }
 
     // ==================== Permissions ====================
@@ -162,6 +174,11 @@ contract GridHookTest is Test {
     }
 
     function testConstructorRevertsForZeroPoolManager() external {
+        uint160 flags = uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+                | Hooks.AFTER_SWAP_FLAG
+        );
+        // We expect the revert before validateHookPermissions, so we can use any address
         vm.expectRevert(GridHook.PoolManagerAddressZero.selector);
         new GridHook(IPoolManager(address(0)));
     }
@@ -345,7 +362,7 @@ contract GridHookTest is Test {
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 5);
@@ -355,7 +372,7 @@ contract GridHookTest is Test {
         assertEq(orders[1].liquidity, 83_300);
         assertEq(orders[2].liquidity, 166_600);
         assertEq(orders[3].liquidity, 250_000);
-        assertEq(orders[4].liquidity, 416_600);
+        assertEq(orders[4].liquidity, 416_800);
 
         assertEq(orders[0].tickLower, -120);
         assertEq(orders[0].tickUpper, -60);
@@ -372,7 +389,7 @@ contract GridHookTest is Test {
         hook.setGridConfig(key, _defaultConfig());
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.PoolNotInitialized.selector, key.toId()));
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
     }
 
     function testDeployGridRevertsWhenAlreadyDeployed() external {
@@ -382,10 +399,10 @@ contract GridHookTest is Test {
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.GridAlreadyDeployed.selector, key.toId(), address(this)));
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
     }
 
     function testDeployGridRevertsWithZeroLiquidity() external {
@@ -396,14 +413,14 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.expectRevert(GridHook.NoAssetsAvailable.selector);
-        hook.deployGrid(key, 0);
+        hook.deployGrid(key, 0, 0, 0);
     }
 
     function testDeployGridRevertsWhenNotConfigured() external {
         PoolKey memory key = _poolKey();
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotConfigured.selector, key.toId(), address(this)));
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
     }
 
     function testDeployGridRevertsWhenSpacingMisaligned() external {
@@ -418,7 +435,7 @@ contract GridHookTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(GridHook.TickSpacingMisaligned.selector, int24(50), int24(60), int24(60))
         );
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
     }
 
     // ==================== Multi-User Deploy ====================
@@ -443,10 +460,10 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.prank(alice);
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         vm.prank(bob);
-        hook.deployGrid(key, 400_000);
+        hook.deployGrid(key, 400_000, 0, 0);
 
         GridTypes.GridOrder[] memory aliceOrders = hook.getGridOrders(key, alice);
         GridTypes.GridOrder[] memory bobOrders = hook.getGridOrders(key, bob);
@@ -455,7 +472,7 @@ contract GridHookTest is Test {
         assertEq(bobOrders.length, 4);
 
         assertEq(aliceOrders[0].liquidity, 83_300);
-        assertEq(aliceOrders[4].liquidity, 416_600);
+        assertEq(aliceOrders[4].liquidity, 416_800);
 
         assertEq(bobOrders[0].liquidity, 100_000);
         assertEq(bobOrders[1].liquidity, 100_000);
@@ -475,11 +492,11 @@ contract GridHookTest is Test {
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         _setMockSlot0(key, 300);
 
-        hook.rebalance(key, address(this));
+        hook.rebalance(key, address(this), 0, 0);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertEq(userState.gridCenterTick, 300);
@@ -499,12 +516,15 @@ contract GridHookTest is Test {
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
+
+        // Authorize alice as keeper
+        hook.setRebalanceKeeper(alice, true);
 
         _setMockSlot0(key, 300);
 
         vm.prank(alice);
-        hook.rebalance(key, address(this));
+        hook.rebalance(key, address(this), 0, 0);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertEq(userState.gridCenterTick, 300);
@@ -518,7 +538,7 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotDeployed.selector, key.toId(), address(this)));
-        hook.rebalance(key, address(this));
+        hook.rebalance(key, address(this), 0, 0);
     }
 
     function testRebalanceDoesNotAffectOtherUser() external {
@@ -534,13 +554,16 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.prank(alice);
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         vm.prank(bob);
-        hook.deployGrid(key, 500_000);
+        hook.deployGrid(key, 500_000, 0, 0);
 
         _setMockSlot0(key, 300);
-        hook.rebalance(key, alice);
+
+        // Rebalance alice's grid as alice herself
+        vm.prank(alice);
+        hook.rebalance(key, alice, 0, 0);
 
         assertEq(hook.getUserState(key, alice).gridCenterTick, 300);
         assertEq(hook.getUserState(key, bob).gridCenterTick, 0);
@@ -558,7 +581,7 @@ contract GridHookTest is Test {
         vm.prank(address(mockPm));
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
         assertTrue(hook.getUserState(key, address(this)).deployed);
 
         hook.closeGrid(key);
@@ -591,10 +614,10 @@ contract GridHookTest is Test {
         hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.prank(alice);
-        hook.deployGrid(key, 1_000_000);
+        hook.deployGrid(key, 1_000_000, 0, 0);
 
         vm.prank(bob);
-        hook.deployGrid(key, 500_000);
+        hook.deployGrid(key, 500_000, 0, 0);
 
         vm.prank(alice);
         hook.closeGrid(key);
