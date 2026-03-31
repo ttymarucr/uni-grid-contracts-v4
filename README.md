@@ -15,11 +15,14 @@ The purpose of this project is to leverage Uniswap V4's concentrated liquidity m
 - **Singleton Multi-Tenant**: One deployed hook supports all users. Each user manages their own grid independently.
 - **Permissionless**: No admin or owner role. Any user can configure and deploy a grid on any initialized pool.
 - **Pull-Based Token Settlement**: Users approve the hook, which pulls tokens via `transferFrom` at deploy/rebalance time. No need to pre-fund the contract.
-- **Keeper-Friendly Rebalance**: Anyone can trigger `rebalance` for any user's grid, enabling automated keeper bots.
+- **Keeper-Authorized Rebalance**: Users authorize specific keeper addresses via `setRebalanceKeeper`. Only the grid owner or an authorized keeper can trigger `rebalance`.
+- **Slippage Protection**: `deployGrid` and `rebalance` accept `maxDelta0` / `maxDelta1` parameters to cap the token amounts the pool may pull or return, reverting if exceeded.
+- **Native ETH Support**: Grid operations are `payable` and the settlement layer handles native ETH pools automatically.
 - **Close Grid**: Users can close their grid at any time to remove all positions and receive tokens back.
 - **Automated Liquidity Management**: Deploy and manage liquidity positions across multiple price ranges.
 - **Customizable Parameters**: Define grid intervals, distribution type, and liquidity amounts per user per pool.
 - **Liquidity Distribution**: Distribute liquidity across grid positions using flat, linear, reverse linear, Fibonacci, sigmoid, or logarithmic distributions.
+- **Deterministic Deployment**: CREATE2-based deploy script with automatic salt mining for hook-flag-compatible addresses. Supports multi-chain deterministic deploys.
 
 ## Use Cases
 
@@ -52,6 +55,9 @@ These distribution types allow users to customize how liquidity is allocated acr
 - **PoolNotInitialized(PoolId poolId)**: The pool has not been initialized yet.
 - **GridAlreadyDeployed(PoolId poolId, address user)**: The user already has a deployed grid on this pool.
 - **GridNotDeployed(PoolId poolId, address user)**: The user has no deployed grid on this pool.
+- **NotAuthorizedRebalancer(address caller, address user)**: The caller is not the grid owner and has not been authorized as a keeper for that user.
+- **SlippageExceeded(int128 actual0, int128 actual1, uint128 maxDelta0, uint128 maxDelta1)**: The net token delta exceeded the caller-specified slippage bounds.
+- **TickRangeOutOfBounds(int24 bottomTick, int24 topTick)**: The computed grid range falls outside the valid tick range (`TickMath.MIN_TICK` / `TickMath.MAX_TICK`).
 
 ## Usage
 
@@ -101,32 +107,50 @@ poolManager.initialize(poolKey, sqrtPriceX96);
 
 ### 4. Approve & Deploy the Grid
 
-The user approves the hook to pull tokens, then calls `deployGrid` to place all grid orders on-chain:
+The user approves the hook to pull tokens, then calls `deployGrid` to place all grid orders on-chain. The `maxDelta0` and `maxDelta1` parameters provide slippage protection — the call reverts if the pool requires more tokens than these bounds (pass `0` to disable the check for a given token):
 
 ```solidity
 // Approve the hook to pull tokens
 IERC20(token0).approve(address(hook), type(uint256).max);
 IERC20(token1).approve(address(hook), type(uint256).max);
 
-// Deploy the grid
+// Deploy the grid with slippage bounds
 uint128 totalLiquidity = 1_000_000e18;
-hook.deployGrid(poolKey, totalLiquidity);
+hook.deployGrid(poolKey, totalLiquidity, maxDelta0, maxDelta1);
 ```
 
 This distributes `totalLiquidity` across the configured number of orders according to the chosen weight distribution. The hook pulls the required tokens from the caller via `transferFrom`.
 
-### 5. Rebalance the Grid
+### 5. Authorize Keepers (Optional)
 
-When the market price moves away from the grid center, call `rebalance` to remove all existing orders and re-deploy them around the new center tick. Anyone can trigger rebalance for any user's grid (keeper-friendly):
+A user can authorize specific addresses to trigger rebalance on their behalf. This enables automated keeper bots while keeping the operation permissioned:
 
 ```solidity
-// Rebalance a specific user's grid (callable by anyone)
-hook.rebalance(poolKey, userAddress);
+// Authorize a keeper
+hook.setRebalanceKeeper(keeperAddress, true);
+
+// Revoke authorization
+hook.setRebalanceKeeper(keeperAddress, false);
+
+// Check authorization
+bool authorized = hook.isRebalanceKeeper(userAddress, keeperAddress);
+```
+
+### 6. Rebalance the Grid
+
+When the market price moves away from the grid center, call `rebalance` to remove all existing orders and re-deploy them around the new center tick. Only the grid owner or an authorized keeper can trigger rebalance:
+
+```solidity
+// Rebalance your own grid
+hook.rebalance(poolKey, msg.sender, maxDelta0, maxDelta1);
+
+// A keeper rebalances a user's grid (requires prior authorization)
+hook.rebalance(poolKey, userAddress, maxDelta0, maxDelta1);
 ```
 
 The user whose grid is being rebalanced must have token approvals in place, as the hook settles net deltas via `transferFrom`.
 
-### 6. Close the Grid
+### 7. Close the Grid
 
 A user can close their grid at any time to remove all positions and receive tokens back:
 
@@ -136,7 +160,7 @@ hook.closeGrid(poolKey);
 
 After closing, the user can reconfigure and redeploy a new grid on the same pool.
 
-### 7. Read-Only Helpers
+### 8. Read-Only Helpers
 
 ```solidity
 // Preview distribution weights without deploying
@@ -173,23 +197,28 @@ hook.setGridConfig(poolKey, GridTypes.GridConfig({
 // 3. Initialize the pool (triggers afterInitialize → records tick)
 poolManager.initialize(poolKey, sqrtPriceX96);
 
-// 4. Approve tokens and deploy the grid
+// 4. Approve tokens and deploy the grid (with slippage bounds)
 IERC20(token0).approve(address(hook), type(uint256).max);
 IERC20(token1).approve(address(hook), type(uint256).max);
-hook.deployGrid(poolKey, 5_000_000e18);
+hook.deployGrid(poolKey, 5_000_000e18, maxDelta0, maxDelta1);
 
-// 5. A keeper rebalances when the price drifts
-hook.rebalance(poolKey, msg.sender);
+// 5. Authorize a keeper for automated rebalancing
+hook.setRebalanceKeeper(keeperAddress, true);
 
-// 6. User closes the grid to withdraw
+// 6. A keeper rebalances when the price drifts
+hook.rebalance(poolKey, msg.sender, maxDelta0, maxDelta1);
+
+// 7. User closes the grid to withdraw
 hook.closeGrid(poolKey);
 ```
 
 ## Architecture
 
-- `src/hooks/GridHook.sol`: singleton hook entrypoint — multi-tenant state container keyed by `(address user, PoolId)`
+- `src/hooks/GridHook.sol`: singleton hook entrypoint — multi-tenant state container keyed by `(address user, PoolId)`. Includes keeper authorization, slippage protection, and native ETH settlement.
 - `src/libraries/GridTypes.sol`: shared enums and structs (`GridConfig`, `GridOrder`, `PoolState`, `UserGridState`)
 - `src/libraries/DistributionWeights.sol`: deterministic weight generation for flat, linear, reverse-linear, Fibonacci, sigmoid, and logarithmic grids
+- `script/DeployGridHook.s.sol`: CREATE2 deployment script with automatic salt mining for hook-flag-compatible addresses. Supports multi-chain deterministic deploys.
+- `script/deploy-all-chains.sh`: shell wrapper to deploy the hook across multiple chains.
 - `test/GridHook.t.sol`: unit tests — permissions, config, deploy, rebalance, close, multi-user isolation
 - `test/GridHookFork.t.sol`: fork tests against Unichain mainnet PoolManager — full lifecycle, pull settlement, multi-user, distribution variants
 
@@ -205,10 +234,10 @@ hook.closeGrid(poolKey);
 
 ### Token Flow (Pull Model)
 
-- **Deploy / Rebalance (owe tokens to pool)**: `IERC20(token).transferFrom(user, poolManager, amount)` → `poolManager.settle()`
+- **Deploy / Rebalance (owe tokens to pool)**: For ERC-20 tokens — `IERC20(token).transferFrom(user, poolManager, amount)` → `poolManager.settle()`. For native ETH — `poolManager.settle{value: amount}()`.
 - **Rebalance / Close (pool returns tokens)**: `poolManager.take(token, user, amount)`
 
-Users must approve the hook before deploying or rebalancing. The hook never holds user funds at rest.
+Users must approve the hook before deploying or rebalancing. The hook never holds user funds at rest. Grid operations (`deployGrid`, `rebalance`, `closeGrid`) are `payable` to support native ETH pools.
 
 ## Hook Model
 
@@ -221,7 +250,7 @@ The starter hook enables these callbacks:
 
 Uniswap v4 activates hooks from the least-significant bits of the deployed hook address. This repo exposes the required flag bitmap through `GridHook.requiredHookFlags()` so deployment tooling can mine or derive a compatible address.
 
-This scaffold does not yet include vanity-address deployment tooling. That should be added before mainnet deployment.
+A CREATE2 deployment script (`script/DeployGridHook.s.sol`) is included that automatically mines a valid salt and deploys to a flag-compatible address. Use `script/deploy-all-chains.sh` for deterministic multi-chain deploys.
 
 ## Development
 
