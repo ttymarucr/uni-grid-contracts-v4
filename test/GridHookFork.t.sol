@@ -7,6 +7,7 @@ import { IERC20 } from "forge-std/interfaces/IERC20.sol";
 import { GridHook } from "src/hooks/GridHook.sol";
 import { GridTypes } from "src/libraries/GridTypes.sol";
 
+import { IAllowanceTransfer } from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
@@ -28,6 +29,9 @@ contract GridHookForkTest is Test {
     // Unichain mainnet PoolManager (deployed by Uniswap)
     address constant POOL_MANAGER = 0x1F98400000000000000000000000000000000004;
 
+    // Canonical Permit2 address (same on all major EVM chains)
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     // sqrtPriceX96 for price = 1 (tick 0)
     uint160 constant SQRT_PRICE_1_1 = 79_228_162_514_264_337_593_543_950_336;
 
@@ -36,6 +40,7 @@ contract GridHookForkTest is Test {
     IPoolManager manager;
     PoolSwapTest swapRouter;
     GridHook hook;
+    IAllowanceTransfer permit2;
     PoolKey key;
 
     address alice = makeAddr("alice");
@@ -45,6 +50,7 @@ contract GridHookForkTest is Test {
         vm.createSelectFork("unichain");
 
         manager = IPoolManager(POOL_MANAGER);
+        permit2 = IAllowanceTransfer(PERMIT2);
         swapRouter = new PoolSwapTest(manager);
 
         uint160 flags = uint160(
@@ -53,13 +59,9 @@ contract GridHookForkTest is Test {
         );
         address hookAddr = address(uint160(type(uint160).max & ~uint160(Hooks.ALL_HOOK_MASK)) | flags);
 
-        deployCodeTo(
-            "GridHook.sol:GridHook",
-            abi.encode(manager),
-            hookAddr
-        );
+        deployCodeTo("GridHook.sol:GridHook", abi.encode(manager, permit2), hookAddr);
 
-        hook = GridHook(hookAddr);
+        hook = GridHook(payable(hookAddr));
 
         // USDC < WETH by address on Unichain → currency0 = USDC, currency1 = WETH
         key = PoolKey({
@@ -96,7 +98,7 @@ contract GridHookForkTest is Test {
 
         // Approve hook to pull tokens, then deploy grid
         _approveHookForTokens(address(this));
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.deployed);
@@ -112,10 +114,8 @@ contract GridHookForkTest is Test {
         // Last order gets remainder (rounding fix)
         assertEq(
             orders[4].liquidity,
-            GRID_LIQUIDITY
-                - uint128(uint256(GRID_LIQUIDITY) * 833 / 10_000)
-                - uint128(uint256(GRID_LIQUIDITY) * 833 / 10_000)
-                - uint128(uint256(GRID_LIQUIDITY) * 1666 / 10_000)
+            GRID_LIQUIDITY - uint128(uint256(GRID_LIQUIDITY) * 833 / 10_000)
+                - uint128(uint256(GRID_LIQUIDITY) * 833 / 10_000) - uint128(uint256(GRID_LIQUIDITY) * 1666 / 10_000)
                 - uint128(uint256(GRID_LIQUIDITY) * 2500 / 10_000)
         );
 
@@ -161,7 +161,7 @@ contract GridHookForkTest is Test {
         // Re-approve for rebalance settlement
         _approveHookForTokens(address(this));
 
-        hook.rebalance(key, address(this), 0, 0);
+        hook.rebalance(key, address(this), type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.gridCenterTick != oldCenter, "center should have moved");
@@ -185,7 +185,7 @@ contract GridHookForkTest is Test {
         hook.setRebalanceKeeper(alice, true);
 
         vm.prank(alice);
-        hook.rebalance(key, address(this), 0, 0);
+        hook.rebalance(key, address(this), type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.gridCenterTick < 0, "center should have moved down");
@@ -203,7 +203,7 @@ contract GridHookForkTest is Test {
         vm.expectEmit(true, true, false, false);
         emit GridHook.GridRebalanced(key.toId(), address(this), int24(0), int24(0));
 
-        hook.rebalance(key, address(this), 0, 0);
+        hook.rebalance(key, address(this), type(uint256).max);
     }
 
     // ==================== Close Grid ====================
@@ -214,7 +214,7 @@ contract GridHookForkTest is Test {
         uint256 wethBefore = IERC20(WETH).balanceOf(address(this));
         uint256 usdcBefore = IERC20(USDC).balanceOf(address(this));
 
-        hook.closeGrid(key);
+        hook.closeGrid(key, type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertFalse(userState.deployed);
@@ -241,7 +241,9 @@ contract GridHookForkTest is Test {
             maxOrders: 4,
             rebalanceThresholdBps: 250,
             distributionType: GridTypes.DistributionType.FLAT,
-            autoRebalance: false
+            autoRebalance: false,
+            maxSlippageDelta0: 0,
+            maxSlippageDelta1: 0
         });
         vm.prank(bob);
         hook.setGridConfig(key, flatConfig);
@@ -253,10 +255,10 @@ contract GridHookForkTest is Test {
         _fundAndApproveUser(bob, 50e18, 500_000_000e6);
 
         vm.prank(alice);
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
 
         vm.prank(bob);
-        hook.deployGrid(key, GRID_LIQUIDITY / 2, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY / 2, 0, 0, type(uint256).max);
 
         // Verify isolation
         GridTypes.GridOrder[] memory aliceOrders = hook.getGridOrders(key, alice);
@@ -282,10 +284,10 @@ contract GridHookForkTest is Test {
         _fundAndApproveUser(bob, 100e18, 1_000_000_000e6);
 
         vm.prank(alice);
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
 
         vm.prank(bob);
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
 
         int24 bobCenterBefore = hook.getUserState(key, bob).gridCenterTick;
 
@@ -299,7 +301,7 @@ contract GridHookForkTest is Test {
 
         // Rebalance only alice (as alice herself)
         vm.prank(alice);
-        hook.rebalance(key, alice, 0, 0);
+        hook.rebalance(key, alice, type(uint256).max);
 
         // Bob grid unchanged
         assertEq(hook.getUserState(key, bob).gridCenterTick, bobCenterBefore);
@@ -379,7 +381,7 @@ contract GridHookForkTest is Test {
         vm.expectEmit(true, true, false, true);
         emit GridHook.GridDeployed(key.toId(), address(this), 5, GRID_LIQUIDITY);
 
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
     }
 
     // ==================== Revert Cases ====================
@@ -388,7 +390,7 @@ contract GridHookForkTest is Test {
         hook.setGridConfig(key, _defaultForkConfig());
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.PoolNotInitialized.selector, key.toId()));
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
     }
 
     function test_fork_rebalanceRevertsWithoutDeploy() public {
@@ -396,14 +398,14 @@ contract GridHookForkTest is Test {
         manager.initialize(key, SQRT_PRICE_1_1);
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.GridNotDeployed.selector, key.toId(), address(this)));
-        hook.rebalance(key, address(this), 0, 0);
+        hook.rebalance(key, address(this), type(uint256).max);
     }
 
     function test_fork_deployGridRevertsWhenAlreadyDeployed() public {
         _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
 
         vm.expectRevert(abi.encodeWithSelector(GridHook.GridAlreadyDeployed.selector, key.toId(), address(this)));
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
     }
 
     function test_fork_deployGridRevertsWithZeroLiquidity() public {
@@ -411,7 +413,7 @@ contract GridHookForkTest is Test {
         manager.initialize(key, SQRT_PRICE_1_1);
 
         vm.expectRevert(GridHook.NoAssetsAvailable.selector);
-        hook.deployGrid(key, 0, 0, 0);
+        hook.deployGrid(key, 0, 0, 0, type(uint256).max);
     }
 
     // ==================== Helpers ====================
@@ -422,7 +424,9 @@ contract GridHookForkTest is Test {
             maxOrders: 5,
             rebalanceThresholdBps: 250,
             distributionType: GridTypes.DistributionType.FIBONACCI,
-            autoRebalance: true
+            autoRebalance: true,
+            maxSlippageDelta0: 0,
+            maxSlippageDelta1: 0
         });
     }
 
@@ -430,8 +434,10 @@ contract GridHookForkTest is Test {
         address user
     ) internal {
         vm.startPrank(user);
-        IERC20(WETH).approve(address(hook), type(uint256).max);
-        IERC20(USDC).approve(address(hook), type(uint256).max);
+        IERC20(WETH).approve(PERMIT2, type(uint256).max);
+        IERC20(USDC).approve(PERMIT2, type(uint256).max);
+        permit2.approve(WETH, address(hook), type(uint160).max, type(uint48).max);
+        permit2.approve(USDC, address(hook), type(uint160).max, type(uint48).max);
         vm.stopPrank();
     }
 
@@ -439,8 +445,10 @@ contract GridHookForkTest is Test {
         address user
     ) internal {
         vm.startPrank(user);
-        IERC20(WETH).approve(address(hook), type(uint256).max);
-        IERC20(USDC).approve(address(hook), type(uint256).max);
+        IERC20(WETH).approve(PERMIT2, type(uint256).max);
+        IERC20(USDC).approve(PERMIT2, type(uint256).max);
+        permit2.approve(WETH, address(hook), type(uint160).max, type(uint48).max);
+        permit2.approve(USDC, address(hook), type(uint160).max, type(uint48).max);
         vm.stopPrank();
     }
 
@@ -464,7 +472,9 @@ contract GridHookForkTest is Test {
             maxOrders: maxOrders,
             rebalanceThresholdBps: 250,
             distributionType: dist,
-            autoRebalance: true
+            autoRebalance: true,
+            maxSlippageDelta0: 0,
+            maxSlippageDelta1: 0
         });
 
         vm.prank(user);
@@ -480,6 +490,6 @@ contract GridHookForkTest is Test {
         _fundAndApproveUser(user, 100e18, 1_000_000_000e6);
 
         vm.prank(user);
-        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0);
+        hook.deployGrid(key, GRID_LIQUIDITY, 0, 0, type(uint256).max);
     }
 }

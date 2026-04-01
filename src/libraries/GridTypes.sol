@@ -17,6 +17,8 @@ library GridTypes {
         uint16 rebalanceThresholdBps;
         DistributionType distributionType;
         bool autoRebalance;
+        uint128 maxSlippageDelta0;
+        uint128 maxSlippageDelta1;
     }
 
     struct GridOrder {

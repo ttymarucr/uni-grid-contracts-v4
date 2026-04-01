@@ -5,6 +5,7 @@ import { Script, console } from "forge-std/Script.sol";
 
 import { GridHook } from "src/hooks/GridHook.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IAllowanceTransfer } from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
 
 /// @title DeployGridHook
@@ -31,6 +32,9 @@ import { Hooks } from "v4-core/libraries/Hooks.sol";
 ///
 ///   3. Deploy to all chains (see script/deploy-all-chains.sh).
 contract DeployGridHookScript is Script {
+    /// @dev Canonical Permit2 address (same on all major EVM chains).
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     /// @dev Exact hook-flag mask that GridHook requires (from requiredHookFlags()).
     uint160 constant REQUIRED_FLAGS = Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
         | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG;
@@ -58,7 +62,7 @@ contract DeployGridHookScript is Script {
         require(success, "CREATE2 deployment failed");
         vm.stopBroadcast();
 
-        hook = GridHook(expected);
+        hook = GridHook(payable(expected));
         require(address(hook.poolManager()) == poolManager, "PoolManager mismatch after deployment");
 
         console.log("GridHook deployed at:", address(hook));
@@ -110,7 +114,9 @@ contract DeployGridHookScript is Script {
     function _initCode(
         address poolManager
     ) internal pure returns (bytes memory) {
-        return abi.encodePacked(type(GridHook).creationCode, abi.encode(IPoolManager(poolManager)));
+        return abi.encodePacked(
+            type(GridHook).creationCode, abi.encode(IPoolManager(poolManager), IAllowanceTransfer(PERMIT2))
+        );
     }
 
     /// @dev Reverts if the address does not carry exactly the required hook-flag bits.

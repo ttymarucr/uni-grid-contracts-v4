@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IAllowanceTransfer } from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
@@ -16,16 +15,17 @@ import { BalanceDelta, BalanceDeltaLibrary } from "v4-core/types/BalanceDelta.so
 import { BeforeSwapDelta, BeforeSwapDeltaLibrary } from "v4-core/types/BeforeSwapDelta.sol";
 import { ModifyLiquidityParams, SwapParams } from "v4-core/types/PoolOperation.sol";
 import { Currency } from "v4-core/types/Currency.sol";
+import { Permit2Forwarder } from "v4-periphery/base/Permit2Forwarder.sol";
+import { Multicall_v4 } from "v4-periphery/base/Multicall_v4.sol";
 
 import { GridTypes } from "../libraries/GridTypes.sol";
 import { DistributionWeights } from "../libraries/DistributionWeights.sol";
 
-contract GridHook is IHooks, IUnlockCallback {
+contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
-    using SafeERC20 for IERC20;
 
-    uint24 private constant MAX_GRID_ORDERS = 1000;
+    uint24 private constant MAX_GRID_ORDERS = 500;
     uint16 private constant MAX_SLIPPAGE_BPS = 500;
 
     enum UnlockAction {
@@ -36,6 +36,8 @@ contract GridHook is IHooks, IUnlockCallback {
 
     error NotPoolManager();
     error PoolManagerAddressZero();
+    error Permit2AddressZero();
+    error ETHRefundFailed();
     error InvalidGridQuantity(uint256 quantity);
     error InvalidGridStep(uint256 stepBps);
     error SlippageTooHigh(uint16 slippageBps);
@@ -48,6 +50,9 @@ contract GridHook is IHooks, IUnlockCallback {
     error NotAuthorizedRebalancer(address caller, address user);
     error SlippageExceeded(int128 actual0, int128 actual1, uint128 maxDelta0, uint128 maxDelta1);
     error TickRangeOutOfBounds(int24 bottomTick, int24 topTick);
+    error DeadlineExpired();
+    error RebalanceThresholdNotMet(int24 tickDelta, int24 minTickDelta);
+    error Reentrancy();
 
     event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
 
@@ -75,6 +80,9 @@ contract GridHook is IHooks, IUnlockCallback {
     // Pool-level state (shared across all users)
     mapping(PoolId poolId => GridTypes.PoolState state) private _poolStates;
 
+    // Reentrancy lock (transient storage)
+    bytes32 private constant _LOCK_SLOT = bytes32(uint256(keccak256("GridHook.lock")) - 1);
+
     // User-scoped state
     mapping(address user => mapping(PoolId poolId => GridTypes.GridConfig config)) private _userConfigs;
     mapping(address user => mapping(PoolId poolId => GridTypes.UserGridState state)) private _userStates;
@@ -82,9 +90,11 @@ contract GridHook is IHooks, IUnlockCallback {
     mapping(address user => mapping(PoolId poolId => GridTypes.GridOrder[] orders)) private _userOrders;
 
     constructor(
-        IPoolManager poolManager_
-    ) {
+        IPoolManager poolManager_,
+        IAllowanceTransfer permit2_
+    ) Permit2Forwarder(permit2_) {
         if (address(poolManager_) == address(0)) revert PoolManagerAddressZero();
+        if (address(permit2_) == address(0)) revert Permit2AddressZero();
         poolManager = poolManager_;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
@@ -94,13 +104,34 @@ contract GridHook is IHooks, IUnlockCallback {
         _;
     }
 
+    modifier nonReentrant() {
+        bytes32 slot = _LOCK_SLOT;
+        uint256 locked;
+        assembly { locked := tload(slot) }
+        if (locked != 0) revert Reentrancy();
+        assembly { tstore(slot, 1) }
+        _;
+        assembly { tstore(slot, 0) }
+    }
+
+    modifier checkDeadline(uint256 deadline) {
+        if (block.timestamp > deadline) revert DeadlineExpired();
+        _;
+    }
+
     // --- Keeper Authorization ---
 
-    function setRebalanceKeeper(address keeper, bool authorized) external {
+    function setRebalanceKeeper(
+        address keeper,
+        bool authorized
+    ) external {
         _rebalanceKeepers[msg.sender][keeper] = authorized;
     }
 
-    function isRebalanceKeeper(address user, address keeper) external view returns (bool) {
+    function isRebalanceKeeper(
+        address user,
+        address keeper
+    ) external view returns (bool) {
         return _rebalanceKeepers[user][keeper];
     }
 
@@ -174,8 +205,9 @@ contract GridHook is IHooks, IUnlockCallback {
         PoolKey calldata key,
         uint128 totalLiquidity,
         uint128 maxDelta0,
-        uint128 maxDelta1
-    ) external payable {
+        uint128 maxDelta1,
+        uint256 deadline
+    ) external payable nonReentrant checkDeadline(deadline) {
         PoolId poolId = key.toId();
         _requireUserConfigured(poolId, msg.sender);
 
@@ -192,16 +224,18 @@ contract GridHook is IHooks, IUnlockCallback {
         }
 
         poolManager.unlock(
-            abi.encode(uint8(UnlockAction.DEPLOY_GRID), abi.encode(msg.sender, key, totalLiquidity, maxDelta0, maxDelta1))
+            abi.encode(
+                uint8(UnlockAction.DEPLOY_GRID), abi.encode(msg.sender, key, totalLiquidity, maxDelta0, maxDelta1)
+            )
         );
+        _refundETH(msg.sender);
     }
 
     function rebalance(
         PoolKey calldata key,
         address user,
-        uint128 maxDelta0,
-        uint128 maxDelta1
-    ) external payable {
+        uint256 deadline
+    ) external payable nonReentrant checkDeadline(deadline) {
         if (msg.sender != user && !_rebalanceKeepers[user][msg.sender]) {
             revert NotAuthorizedRebalancer(msg.sender, user);
         }
@@ -212,18 +246,25 @@ contract GridHook is IHooks, IUnlockCallback {
         GridTypes.UserGridState storage userState = _userStates[user][poolId];
         if (!userState.deployed) revert GridNotDeployed(poolId, user);
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key, maxDelta0, maxDelta1)));
+        poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key)));
+        _refundETH(msg.sender);
     }
 
     function closeGrid(
-        PoolKey calldata key
-    ) external payable {
+        PoolKey calldata key,
+        uint256 deadline
+    ) external payable nonReentrant checkDeadline(deadline) {
         PoolId poolId = key.toId();
 
         GridTypes.UserGridState storage userState = _userStates[msg.sender][poolId];
         if (!userState.deployed) revert GridNotDeployed(poolId, msg.sender);
 
         poolManager.unlock(abi.encode(uint8(UnlockAction.CLOSE_GRID), abi.encode(msg.sender, key)));
+        _refundETH(msg.sender);
+    }
+
+    receive() external payable {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
     }
 
     function unlockCallback(
@@ -238,9 +279,8 @@ contract GridHook is IHooks, IUnlockCallback {
                 abi.decode(payload, (address, PoolKey, uint128, uint128, uint128));
             _executeDeploy(user, key, totalLiquidity, maxDelta0, maxDelta1);
         } else if (action == uint8(UnlockAction.REBALANCE)) {
-            (address user, PoolKey memory key, uint128 maxDelta0, uint128 maxDelta1) =
-                abi.decode(payload, (address, PoolKey, uint128, uint128));
-            _executeRebalance(user, key, maxDelta0, maxDelta1);
+            (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
+            _executeRebalance(user, key);
         } else {
             (address user, PoolKey memory key) = abi.decode(payload, (address, PoolKey));
             _executeClose(user, key);
@@ -445,11 +485,10 @@ contract GridHook is IHooks, IUnlockCallback {
 
     function _executeRebalance(
         address user,
-        PoolKey memory key,
-        uint128 maxDelta0,
-        uint128 maxDelta1
+        PoolKey memory key
     ) internal {
         PoolId poolId = key.toId();
+        GridTypes.GridConfig storage config = _userConfigs[user][poolId];
         int24 oldCenter = _userStates[user][poolId].gridCenterTick;
 
         (int128 removeDelta0, int128 removeDelta1, uint128 totalLiquidity) = _removeAllOrders(key, user, poolId);
@@ -461,13 +500,22 @@ contract GridHook is IHooks, IUnlockCallback {
             newCenter = _alignTick(currentTick, key.tickSpacing);
         }
 
+        // Enforce rebalance threshold — prevent no-op or dust rebalances
+        {
+            int24 tickDelta = newCenter > oldCenter ? newCenter - oldCenter : oldCenter - newCenter;
+            int24 minTickDelta = config.gridSpacing * int24(uint24(config.rebalanceThresholdBps)) / 10_000;
+            if (minTickDelta > 0 && tickDelta < minTickDelta) {
+                revert RebalanceThresholdNotMet(tickDelta, minTickDelta);
+            }
+        }
+
         {
             (int128 addDelta0, int128 addDelta1) = _placeNewOrders(key, user, poolId, newCenter, totalLiquidity);
             removeDelta0 += addDelta0;
             removeDelta1 += addDelta1;
         }
 
-        _checkSlippage(removeDelta0, removeDelta1, maxDelta0, maxDelta1);
+        _checkSlippage(removeDelta0, removeDelta1, config.maxSlippageDelta0, config.maxSlippageDelta1);
         _settleForUser(key, user, removeDelta0, removeDelta1);
 
         _userStates[user][poolId].gridCenterTick = newCenter;
@@ -590,16 +638,28 @@ contract GridHook is IHooks, IUnlockCallback {
             // forge-lint: disable-next-line(unsafe-typecast)
             uint256 amount = uint256(uint128(-delta));
             if (currency.isAddressZero()) {
-                poolManager.settle{value: amount}();
+                poolManager.settle{ value: amount }();
             } else {
                 poolManager.sync(currency);
-                IERC20(Currency.unwrap(currency)).safeTransferFrom(user, address(poolManager), amount);
+                // casting is safe: Permit2 uses uint160 amounts; pool deltas cannot exceed uint160 for any realistic supply
+                // forge-lint: disable-next-line(unsafe-typecast)
+                permit2.transferFrom(user, address(poolManager), uint160(amount), Currency.unwrap(currency));
                 poolManager.settle();
             }
         } else if (delta > 0) {
             // casting is safe: delta > 0 so positive int128 fits uint128; uint256 widening is lossless
             // forge-lint: disable-next-line(unsafe-typecast)
             poolManager.take(currency, user, uint256(uint128(delta)));
+        }
+    }
+
+    function _refundETH(
+        address to
+    ) internal {
+        uint256 balance = address(this).balance;
+        if (balance > 0) {
+            (bool success,) = to.call{ value: balance }("");
+            if (!success) revert ETHRefundFailed();
         }
     }
 
@@ -615,11 +675,11 @@ contract GridHook is IHooks, IUnlockCallback {
     ) internal pure returns (GridTypes.GridOrder[] memory orders) {
         orders = new GridTypes.GridOrder[](maxOrders);
 
-        // casting is safe: maxOrders <= MAX_GRID_ORDERS (1000), so maxOrders/2 <= 500 which fits int24
+        // casting is safe: maxOrders <= MAX_GRID_ORDERS (500), so maxOrders/2 <= 250 which fits int24
         // forge-lint: disable-next-line(unsafe-typecast)
         int24 halfOrders = int24(uint24(maxOrders / 2));
         int24 bottomTick = _alignTick(centerTick - (halfOrders * gridSpacing), tickSpacing);
-        // casting is safe: maxOrders <= 1000 fits int24
+        // casting is safe: maxOrders <= 500 fits int24
         // forge-lint: disable-next-line(unsafe-typecast)
         int24 topTick = bottomTick + int24(uint24(maxOrders)) * gridSpacing;
 
@@ -629,7 +689,7 @@ contract GridHook is IHooks, IUnlockCallback {
 
         uint128 distributed;
         for (uint256 i; i < maxOrders; ++i) {
-            // casting is safe: i < maxOrders <= 1000, fits int256 and int24
+            // casting is safe: i < maxOrders <= 500, fits int256 and int24
             // forge-lint: disable-next-line(unsafe-typecast)
             int24 tickLower = bottomTick + int24(int256(i)) * gridSpacing;
             int24 tickUpper = tickLower + gridSpacing;
