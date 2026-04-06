@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository provides a set of smart contracts and tools designed to implement a grid trading strategy on Uniswap V4. Grid trading is a systematic trading approach that places buy and sell orders at predefined price intervals, enabling automated and efficient liquidity management.
+This repository provides a set of smart contracts and tools designed to implement a grid trading strategy on Uniswap V4. It is intended as a **practical example** of how grid trading can be built on top of Uniswap V4 Hooks. Grid trading is a systematic trading approach that places buy and sell orders at predefined price intervals, enabling automated and efficient liquidity management.
 
 The hook is deployed as a **singleton** — a single `GridHook` instance serves all users. Each user independently configures, deploys, rebalances, and closes their own grid on any pool. There is no admin or owner role; the contract is fully permissionless.
 
@@ -272,6 +272,16 @@ Uniswap v4 does not auto-compound fees. When liquidity is removed (during `rebal
 - During `closeGrid`, all accrued fees are returned to the user along with the principal.
 - Fees are **not** reinvested into new positions. They are settled as a net token transfer to the grid owner after each operation.
 
+## Important: Fee Accrual Requires Hook-Routed Swaps
+
+In Uniswap V4, liquidity positions only earn fees from swaps that are **explicitly routed through the hook** specified during the swap call. If a swap is executed on the same pool but does not specify this hook (or specifies a different hook), the grid's liquidity positions **will not accrue any fees** from that swap. This is an inherent property of the Uniswap V4 protocol — hooks are opt-in per swap, and there is no mechanism to force all swaps on a pool to route through a particular hook.
+
+In practice this means:
+
+- Grid deployments will only earn trading fees when swappers use a router (or call `swap` directly) that passes the correct `PoolKey` with this hook's address.
+- Swaps routed through other hooks, or through the pool without any hook, will not generate fees for your grid positions.
+- fee earnings depend entirely on third-party swap volume that opts into this hook.
+
 ## Hook Model
 
 The starter hook enables these callbacks:
@@ -291,11 +301,8 @@ The `GridHook` singleton is deployed at the following addresses (CREATE2-determi
 
 | Chain | Address |
 |---|---|
-| Ethereum | [`0x9Dd80C8074a981b3646520F4d8fc4F66Af07d540`](https://etherscan.io/address/0x9Dd80C8074a981b3646520F4d8fc4F66Af07d540) |
 | Unichain | [`0x82405512C6675613e8A5f6b1E8FcDb360f63d540`](https://uniscan.xyz/address/0x82405512C6675613e8A5f6b1E8FcDb360f63d540) |
-| Arbitrum | [`0x02926a28B3Dd3Aa6808dfa70c496B1f052aB9540`](https://arbiscan.io/address/0x02926a28B3Dd3Aa6808dfa70c496B1f052aB9540) |
-| Base | [`0x593645c4CA132bc1eF78d06B13bc266770AD9540`](https://basescan.org/address/0x593645c4CA132bc1eF78d06B13bc266770AD9540) |
-| BNB Chain | [`0xeD2deC525D48FCD1afedbef869d4A9c285c65540`](https://bscscan.com/address/0xeD2deC525D48FCD1afedbef869d4A9c285c65540) |
+
 
 ## Development
 
@@ -328,6 +335,12 @@ forge fmt
 ## Contributing
 
 Contributions are welcome! Please submit issues or pull requests to help improve the project. For major changes, please open an issue first to discuss your ideas.
+
+## Disclaimer
+
+This software is provided **"as is"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
+
+This project is a **practical example and educational resource** for grid trading on Uniswap V4. It is **not** financial advice. Deploying grids, providing liquidity, and interacting with DeFi protocols carry significant risks, including but not limited to impermanent loss, smart contract vulnerabilities, and total loss of funds. Users are solely responsible for their own due diligence and bear all risks associated with the use of this software. By using this software, you acknowledge that you do so at your own risk.
 
 ## License
 
