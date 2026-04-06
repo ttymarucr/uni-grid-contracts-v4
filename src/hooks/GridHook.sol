@@ -6,7 +6,6 @@ import { IHooks } from "v4-core/interfaces/IHooks.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
 import { IUnlockCallback } from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import { Hooks } from "v4-core/libraries/Hooks.sol";
-import { Position } from "v4-core/libraries/Position.sol";
 import { StateLibrary } from "v4-core/libraries/StateLibrary.sol";
 import { TickMath } from "v4-core/libraries/TickMath.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
@@ -147,6 +146,9 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
             revert InvalidGridQuantity(config.maxOrders);
         }
         if (config.rebalanceThresholdBps > MAX_SLIPPAGE_BPS) revert SlippageTooHigh(config.rebalanceThresholdBps);
+        if (config.gridSpacing % key.tickSpacing != 0) {
+            revert TickSpacingMisaligned(config.gridSpacing, key.tickSpacing, key.tickSpacing);
+        }
 
         PoolId poolId = key.toId();
         _userConfigs[msg.sender][poolId] = config;
@@ -197,6 +199,43 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
         address user
     ) external view returns (GridTypes.GridOrder[] memory) {
         return _userOrders[user][key.toId()];
+    }
+
+    
+
+    function getAccumulatedFees(
+        PoolKey calldata key,
+        address user
+    ) external view returns (GridTypes.OrderFeeData[] memory perOrderFeeData) {
+        PoolId poolId = key.toId();
+        GridTypes.GridOrder[] storage orders = _userOrders[user][poolId];
+        uint256 len = orders.length;
+        perOrderFeeData = new GridTypes.OrderFeeData[](len);
+
+        bytes32 userSalt = bytes32(uint256(uint160(user)));
+
+        for (uint256 i; i < len; ++i) {
+            GridTypes.GridOrder storage order = orders[i];
+            if (order.liquidity == 0) continue;
+
+            bytes32 salt = keccak256(abi.encodePacked(userSalt, i));
+
+            (uint128 liq, uint256 fg0Last, uint256 fg1Last) = poolManager.getPositionInfo(
+                poolId, address(this), order.tickLower, order.tickUpper, salt
+            );
+
+            (uint256 fg0, uint256 fg1) = poolManager.getFeeGrowthInside(
+                poolId, order.tickLower, order.tickUpper
+            );
+
+            perOrderFeeData[i] = GridTypes.OrderFeeData(liq, fg0, fg1, fg0Last, fg1Last);
+        }
+    }
+
+    function getPoolManagerSlot0(
+        PoolKey calldata key
+    ) external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee) {
+        return poolManager.getSlot0(key.toId());
     }
 
     // --- Grid Operations ---
@@ -291,33 +330,6 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
     // --- Utility ---
 
-    function computePositionKey(
-        address owner,
-        int24 tickLower,
-        int24 tickUpper,
-        bytes32 salt
-    ) external pure returns (bytes32) {
-        return Position.calculatePositionKey(owner, tickLower, tickUpper, salt);
-    }
-
-    function previewWeights(
-        uint256 gridLength,
-        GridTypes.DistributionType distributionType
-    ) external pure returns (uint256[] memory) {
-        return DistributionWeights.getWeights(gridLength, distributionType);
-    }
-
-    function computeGridOrders(
-        int24 centerTick,
-        int24 gridSpacing,
-        int24 tickSpacing,
-        uint24 maxOrders,
-        uint256[] memory weights,
-        uint128 totalLiquidity
-    ) external pure returns (GridTypes.GridOrder[] memory) {
-        return _computeGridOrders(centerTick, gridSpacing, tickSpacing, maxOrders, weights, totalLiquidity);
-    }
-
     function getHookPermissions() public pure returns (Hooks.Permissions memory permissions) {
         permissions = Hooks.Permissions({
             beforeInitialize: false,
@@ -335,11 +347,6 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
-    }
-
-    function requiredHookFlags() public pure returns (uint160) {
-        return Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-            | Hooks.AFTER_SWAP_FLAG;
     }
 
     // --- Hook Callbacks ---
@@ -573,6 +580,8 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
             GridTypes.GridOrder storage order = existingOrders[i];
             totalLiquidity += order.liquidity;
 
+            if (order.liquidity == 0) continue;
+
             (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
                 key,
                 ModifyLiquidityParams({
@@ -599,6 +608,8 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
         for (uint256 i; i < orders.length; ++i) {
             _userOrders[user][poolId].push(orders[i]);
+
+            if (orders[i].liquidity == 0) continue;
 
             (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
                 key,

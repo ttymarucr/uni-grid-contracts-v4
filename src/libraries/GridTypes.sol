@@ -37,4 +37,12 @@ library GridTypes {
         bool deployed;
         int24 gridCenterTick;
     }
+
+    struct OrderFeeData {
+        uint128 liquidity;
+        uint256 feeGrowthInside0X128;
+        uint256 feeGrowthInside1X128;
+        uint256 feeGrowthInside0LastX128;
+        uint256 feeGrowthInside1LastX128;
+    }
 }

@@ -285,6 +285,18 @@ Uniswap v4 activates hooks from the least-significant bits of the deployed hook 
 
 A CREATE2 deployment script (`script/DeployGridHook.s.sol`) is included that automatically mines a valid salt and deploys to a flag-compatible address. Use `script/deploy-all-chains.sh` for deterministic multi-chain deploys.
 
+## Deployments
+
+The `GridHook` singleton is deployed at the following addresses (CREATE2-deterministic):
+
+| Chain | Address |
+|---|---|
+| Ethereum | [`0x9Dd80C8074a981b3646520F4d8fc4F66Af07d540`](https://etherscan.io/address/0x9Dd80C8074a981b3646520F4d8fc4F66Af07d540) |
+| Unichain | [`0x82405512C6675613e8A5f6b1E8FcDb360f63d540`](https://uniscan.xyz/address/0x82405512C6675613e8A5f6b1E8FcDb360f63d540) |
+| Arbitrum | [`0x02926a28B3Dd3Aa6808dfa70c496B1f052aB9540`](https://arbiscan.io/address/0x02926a28B3Dd3Aa6808dfa70c496B1f052aB9540) |
+| Base | [`0x593645c4CA132bc1eF78d06B13bc266770AD9540`](https://basescan.org/address/0x593645c4CA132bc1eF78d06B13bc266770AD9540) |
+| BNB Chain | [`0xeD2deC525D48FCD1afedbef869d4A9c285c65540`](https://bscscan.com/address/0xeD2deC525D48FCD1afedbef869d4A9c285c65540) |
+
 ## Development
 
 Build:

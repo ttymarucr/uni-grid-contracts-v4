@@ -4,10 +4,8 @@ out = "out"
 libs = ["lib"]
 solc = "0.8.26"
 optimizer = true
-optimizer_runs = 20000
+optimizer_runs = 800
 evm_version = "cancun"
-fork_url = "unichain"
-fork_chain_id = 130
 
 [lint]
 severity = ["high", "med"]

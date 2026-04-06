@@ -19,6 +19,8 @@ import { ModifyLiquidityParams, SwapParams } from "v4-core/types/PoolOperation.s
 contract MockPoolManager {
     mapping(bytes32 => bytes32) private _extsloadData;
 
+    error CannotUpdateEmptyPosition();
+
     function extsload(
         bytes32 slot
     ) external view returns (bytes32) {
@@ -40,9 +42,10 @@ contract MockPoolManager {
 
     function modifyLiquidity(
         PoolKey memory,
-        ModifyLiquidityParams memory,
+        ModifyLiquidityParams memory params,
         bytes calldata
     ) external returns (BalanceDelta, BalanceDelta) {
+        if (params.liquidityDelta == 0) revert CannotUpdateEmptyPosition();
         return (BalanceDelta.wrap(0), BalanceDelta.wrap(0));
     }
 
@@ -89,13 +92,6 @@ contract GridHookTest is Test {
     }
 
     // ==================== Permissions ====================
-
-    function testRequiredHookFlags() external view {
-        uint160 expected = Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
-            | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG;
-
-        assertEq(hook.requiredHookFlags(), expected);
-    }
 
     function testGetHookPermissions() external view {
         Hooks.Permissions memory permissions = hook.getHookPermissions();
@@ -252,111 +248,6 @@ contract GridHookTest is Test {
         assertEq(state.swapCount, 0);
     }
 
-    // ==================== Weight Previews ====================
-
-    function testPreviewWeightsSupportsFlatDistribution() external view {
-        uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.FLAT);
-
-        assertEq(weights.length, 4);
-        assertEq(weights[0], 2500);
-        assertEq(weights[1], 2500);
-        assertEq(weights[2], 2500);
-        assertEq(weights[3], 2500);
-    }
-
-    function testPreviewWeightsSupportsLinearDistribution() external view {
-        uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.LINEAR);
-
-        assertEq(weights.length, 4);
-        assertEq(weights[0], 1000);
-        assertEq(weights[1], 2000);
-        assertEq(weights[2], 3000);
-        assertEq(weights[3], 4000);
-    }
-
-    function testPreviewWeightsSupportsReverseLinearDistribution() external view {
-        uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.REVERSE_LINEAR);
-
-        assertEq(weights.length, 4);
-        assertEq(weights[0], 4000);
-        assertEq(weights[1], 3000);
-        assertEq(weights[2], 2000);
-        assertEq(weights[3], 1000);
-    }
-
-    function testPreviewWeightsSupportsFibonacciDistribution() external view {
-        uint256[] memory weights = hook.previewWeights(5, GridTypes.DistributionType.FIBONACCI);
-
-        assertEq(weights.length, 5);
-        assertEq(weights[0], 833);
-        assertEq(weights[1], 833);
-        assertEq(weights[2], 1666);
-        assertEq(weights[3], 2500);
-        assertEq(weights[4], 4166);
-    }
-
-    // ==================== Grid Computation ====================
-
-    function testComputeGridOrdersTickRanges() external view {
-        uint256[] memory weights = hook.previewWeights(5, GridTypes.DistributionType.FLAT);
-        GridTypes.GridOrder[] memory orders = hook.computeGridOrders(0, 60, 60, 5, weights, 1_000_000);
-
-        assertEq(orders.length, 5);
-        assertEq(orders[0].tickLower, -120);
-        assertEq(orders[0].tickUpper, -60);
-        assertEq(orders[1].tickLower, -60);
-        assertEq(orders[1].tickUpper, 0);
-        assertEq(orders[2].tickLower, 0);
-        assertEq(orders[2].tickUpper, 60);
-        assertEq(orders[3].tickLower, 60);
-        assertEq(orders[3].tickUpper, 120);
-        assertEq(orders[4].tickLower, 120);
-        assertEq(orders[4].tickUpper, 180);
-    }
-
-    function testComputeGridOrdersLiquidityDistribution() external view {
-        uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.LINEAR);
-        GridTypes.GridOrder[] memory orders = hook.computeGridOrders(0, 60, 60, 4, weights, 100_000);
-
-        assertEq(orders[0].liquidity, 10_000);
-        assertEq(orders[1].liquidity, 20_000);
-        assertEq(orders[2].liquidity, 30_000);
-        assertEq(orders[3].liquidity, 40_000);
-    }
-
-    function testComputeGridOrdersSingleOrder() external view {
-        uint256[] memory weights = hook.previewWeights(1, GridTypes.DistributionType.FLAT);
-        GridTypes.GridOrder[] memory orders = hook.computeGridOrders(0, 60, 60, 1, weights, 500_000);
-
-        assertEq(orders.length, 1);
-        assertEq(orders[0].tickLower, 0);
-        assertEq(orders[0].tickUpper, 60);
-        assertEq(orders[0].liquidity, 500_000);
-    }
-
-    function testComputeGridOrdersNegativeCenter() external view {
-        uint256[] memory weights = hook.previewWeights(4, GridTypes.DistributionType.FLAT);
-        GridTypes.GridOrder[] memory orders = hook.computeGridOrders(-180, 60, 60, 4, weights, 40_000);
-
-        assertEq(orders[0].tickLower, -300);
-        assertEq(orders[0].tickUpper, -240);
-        assertEq(orders[3].tickLower, -120);
-        assertEq(orders[3].tickUpper, -60);
-        assertEq(orders[0].liquidity, 10_000);
-    }
-
-    function testComputePositionKeyMatchesCoreFormula() external view {
-        address owner = address(0xCAFE);
-        int24 tickLower = -120;
-        int24 tickUpper = 120;
-        bytes32 salt = bytes32(uint256(42));
-
-        bytes32 expected = keccak256(abi.encodePacked(owner, tickLower, tickUpper, salt));
-        bytes32 computed = hook.computePositionKey(owner, tickLower, tickUpper, salt);
-
-        assertEq(computed, expected);
-    }
-
     // ==================== Deploy Grid ====================
 
     function testDeployGridCreatesOrders() external {
@@ -418,6 +309,71 @@ contract GridHookTest is Test {
 
         vm.expectRevert(GridHook.NoAssetsAvailable.selector);
         hook.deployGrid(key, 0, 0, 0, type(uint256).max);
+    }
+
+    function _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType dist) internal {
+        PoolKey memory key = _poolKey();
+        GridTypes.GridConfig memory config = GridTypes.GridConfig({
+            gridSpacing: 60,
+            maxOrders: 30,
+            rebalanceThresholdBps: 100,
+            distributionType: dist,
+            autoRebalance: true,
+            maxSlippageDelta0: 0,
+            maxSlippageDelta1: 0
+        });
+        hook.setGridConfig(key, config);
+
+        vm.prank(address(mockPm));
+        hook.afterInitialize(address(this), key, 1 << 96, 0);
+
+        // Small liquidity + 30 orders → some distributions produce weight-0 orders
+        hook.deployGrid(key, 1_000_000, 0, 0, type(uint256).max);
+
+        GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
+        assertEq(orders.length, 30);
+
+        // Total liquidity across all orders must equal the input
+        uint128 totalLiq;
+        for (uint256 i; i < orders.length; ++i) {
+            totalLiq += orders[i].liquidity;
+        }
+        assertEq(totalLiq, 1_000_000);
+
+        assertTrue(hook.getUserState(key, address(this)).deployed);
+
+        // Rebalance should also succeed with zero-liquidity orders
+        _setMockSlot0(key, 300);
+        hook.rebalance(key, address(this), type(uint256).max);
+        assertEq(hook.getUserState(key, address(this)).gridCenterTick, 300);
+
+        // Close should also succeed with zero-liquidity orders
+        hook.closeGrid(key, type(uint256).max);
+        assertFalse(hook.getUserState(key, address(this)).deployed);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Flat() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.FLAT);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Linear() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.LINEAR);
+    }
+
+    function testDeployWithZeroLiquidityOrders_ReverseLinear() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.REVERSE_LINEAR);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Fibonacci() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.FIBONACCI);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Sigmoid() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.SIGMOID);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Logarithmic() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.LOGARITHMIC);
     }
 
     function testDeployGridRevertsWhenNotConfigured() external {

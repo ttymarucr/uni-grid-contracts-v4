@@ -13,17 +13,36 @@
 #
 set -eu
 
-CHAINS=("ethereum" "unichain" "arbitrum" "base" "bnb")
+declare -A POOL_MANAGERS=(
+  [ethereum]="0x000000000004444c5dc75cB358380D2e3dE08A90"
+  [unichain]="0x1f98400000000000000000000000000000000004"
+  [arbitrum]="0x360e68faccca8ca495c1b759fd9eee466db9fb32"
+  [base]="0x498581ff718922c3f8e6a244956af099b2652b2b"
+  [bsc]="0x28e2ea090877bf75740558f6bfb36a5ffee9e9df"
+)
 
-: "${POOL_MANAGER:?Set POOL_MANAGER to the canonical PoolManager address}"
-: "${HOOK_SALT:?Set HOOK_SALT – run mineSalt() first}"
+declare -A SALTS=(
+  [ethereum]="0x"
+  [unichain]="0x"
+  [arbitrum]="0x"
+  [base]="0x"
+  [bsc]="0x"
+)
+
+CHAINS=("ethereum" "unichain" "arbitrum" "base" "bsc")
 
 for chain in "${CHAINS[@]}"; do
+  POOL_MANAGER="${POOL_MANAGERS[$chain]}"
+  SALT="${SALTS[$chain]}"
+
   echo "══════════════════════════════════════════════"
   echo " Deploying to ${chain} ..."
+  echo " Pool Manager: ${POOL_MANAGER}"
+  echo " Salt        : ${SALT}"
   echo "══════════════════════════════════════════════"
 
-  POOL_MANAGER="$POOL_MANAGER" HOOK_SALT="$HOOK_SALT" \
+  POOL_MANAGER="$POOL_MANAGER" \
+    HOOK_SALT="$SALT" \
     forge script script/DeployGridHook.s.sol \
       --rpc-url "$chain" \
       --broadcast \

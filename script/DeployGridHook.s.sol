@@ -52,12 +52,14 @@ contract DeployGridHookScript is Script {
         address expected = vm.computeCreate2Address(salt, keccak256(initCode), CREATE2_FACTORY);
         _assertValidFlags(expected);
 
+        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+
         console.log("Chain ID      :", block.chainid);
         console.log("Pool Manager  :", poolManager);
         console.log("Salt          :", vm.toString(salt));
         console.log("Expected addr :", expected);
 
-        vm.startBroadcast();
+        vm.startBroadcast(deployerPrivateKey);
         (bool success,) = CREATE2_FACTORY.call(abi.encodePacked(salt, initCode));
         require(success, "CREATE2 deployment failed");
         vm.stopBroadcast();
