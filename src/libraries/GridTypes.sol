@@ -36,6 +36,8 @@ library GridTypes {
     struct UserGridState {
         bool deployed;
         int24 gridCenterTick;
+        uint48 lastActionTimestamp;
+        uint32 rebalanceCount;
     }
 
     struct OrderFeeData {

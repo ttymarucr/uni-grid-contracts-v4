@@ -277,6 +277,8 @@ contract GridHookTest is Test {
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.deployed);
         assertEq(userState.gridCenterTick, 0);
+        assertTrue(userState.lastActionTimestamp > 0);
+        assertEq(userState.rebalanceCount, 0);
     }
 
     function testDeployGridRevertsWhenNotInitialized() external {
@@ -387,15 +389,11 @@ contract GridHookTest is Test {
         PoolKey memory key = _poolKey();
         GridTypes.GridConfig memory config = _defaultConfig();
         config.gridSpacing = 50;
-        hook.setGridConfig(key, config);
-
-        vm.prank(address(mockPm));
-        hook.afterInitialize(address(this), key, 1 << 96, 0);
 
         vm.expectRevert(
             abi.encodeWithSelector(GridHook.TickSpacingMisaligned.selector, int24(50), int24(60), int24(60))
         );
-        hook.deployGrid(key, 1_000_000, 0, 0, type(uint256).max);
+        hook.setGridConfig(key, config);
     }
 
     // ==================== Multi-User Deploy ====================
@@ -551,6 +549,8 @@ contract GridHookTest is Test {
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertFalse(userState.deployed);
         assertEq(userState.gridCenterTick, 0);
+        assertEq(userState.lastActionTimestamp, 0);
+        assertEq(userState.rebalanceCount, 0);
 
         GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 0);

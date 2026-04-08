@@ -102,6 +102,8 @@ contract GridHookForkTest is Test {
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.deployed);
+        assertTrue(userState.lastActionTimestamp > 0);
+        assertEq(userState.rebalanceCount, 0);
 
         GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 5);
@@ -166,6 +168,8 @@ contract GridHookForkTest is Test {
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertTrue(userState.gridCenterTick != oldCenter, "center should have moved");
         assertTrue(userState.gridCenterTick < oldCenter, "center should have moved down");
+        assertTrue(userState.lastActionTimestamp > 0);
+        assertEq(userState.rebalanceCount, 1);
 
         GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 5);
@@ -218,6 +222,8 @@ contract GridHookForkTest is Test {
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
         assertFalse(userState.deployed);
+        assertEq(userState.lastActionTimestamp, 0);
+        assertEq(userState.rebalanceCount, 0);
 
         GridTypes.GridOrder[] memory orders = hook.getGridOrders(key, address(this));
         assertEq(orders.length, 0);

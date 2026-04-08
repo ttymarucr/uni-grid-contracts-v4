@@ -485,6 +485,7 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
         _userStates[user][poolId].deployed = true;
         _userStates[user][poolId].gridCenterTick = centerTick;
+        _userStates[user][poolId].lastActionTimestamp = uint48(block.timestamp);
 
         GridTypes.GridConfig storage config = _userConfigs[user][poolId];
         emit GridDeployed(poolId, user, config.maxOrders, totalLiquidity);
@@ -526,6 +527,8 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
         _settleForUser(key, user, removeDelta0, removeDelta1);
 
         _userStates[user][poolId].gridCenterTick = newCenter;
+        _userStates[user][poolId].lastActionTimestamp = uint48(block.timestamp);
+        _userStates[user][poolId].rebalanceCount += 1;
 
         emit GridRebalanced(poolId, user, oldCenter, newCenter);
     }
@@ -562,6 +565,8 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
         _userStates[user][poolId].deployed = false;
         _userStates[user][poolId].gridCenterTick = 0;
+        _userStates[user][poolId].lastActionTimestamp = 0;
+        _userStates[user][poolId].rebalanceCount = 0;
 
         emit GridClosed(poolId, user);
     }
