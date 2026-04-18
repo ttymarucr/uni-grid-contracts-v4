@@ -31,6 +31,9 @@ library GridTypes {
         bool initialized;
         int24 currentTick;
         uint32 swapCount;
+        uint256 lastSwapBlock;
+        int24 blockStartTick;
+        uint16 swapsThisBlock;
     }
 
     struct UserGridState {

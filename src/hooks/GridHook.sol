@@ -26,6 +26,8 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
     uint24 private constant MAX_GRID_ORDERS = 500;
     uint16 private constant MAX_SLIPPAGE_BPS = 500;
+    uint16 public constant MAX_TICK_MOVEMENT_PER_BLOCK = 500;
+    uint48 private constant MIN_REBALANCE_COOLDOWN = 60;
 
     enum UnlockAction {
         DEPLOY_GRID,
@@ -52,6 +54,10 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
     error DeadlineExpired();
     error RebalanceThresholdNotMet(int24 tickDelta, int24 minTickDelta);
     error Reentrancy();
+    error ExcessivePriceImpact(int24 tickDelta, uint16 maxAllowed);
+    error RebalanceInSameBlockAsSwap();
+    error RebalanceCooldownNotMet();
+    error KeeperRebalanceBlockedDuringVolatility();
 
     event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
 
@@ -275,15 +281,25 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
         address user,
         uint256 deadline
     ) external payable nonReentrant checkDeadline(deadline) {
-        if (msg.sender != user && !_rebalanceKeepers[user][msg.sender]) {
-            revert NotAuthorizedRebalancer(msg.sender, user);
+        PoolId poolId = key.toId();
+
+        // MEV protection: block rebalance in the same block as a swap
+        GridTypes.PoolState storage pool = _poolStates[poolId];
+        if (block.number == pool.lastSwapBlock) revert RebalanceInSameBlockAsSwap();
+
+        if (msg.sender != user) {
+            if (!_rebalanceKeepers[user][msg.sender]) revert NotAuthorizedRebalancer(msg.sender, user);
         }
 
-        PoolId poolId = key.toId();
         _requireUserConfigured(poolId, user);
 
         GridTypes.UserGridState storage userState = _userStates[user][poolId];
         if (!userState.deployed) revert GridNotDeployed(poolId, user);
+
+        // Cooldown: prevent rapid-fire rebalances
+        if (block.timestamp < userState.lastActionTimestamp + MIN_REBALANCE_COOLDOWN) {
+            revert RebalanceCooldownNotMet();
+        }
 
         poolManager.unlock(abi.encode(uint8(UnlockAction.REBALANCE), abi.encode(user, key)));
         _refundETH(msg.sender);
@@ -338,7 +354,7 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
             afterAddLiquidity: true,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: true,
-            beforeSwap: false,
+            beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
@@ -417,10 +433,21 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
 
     function beforeSwap(
         address,
-        PoolKey calldata,
+        PoolKey calldata key,
         SwapParams calldata,
         bytes calldata
-    ) external pure override returns (bytes4, BeforeSwapDelta, uint24) {
+    ) external override onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
+        PoolId poolId = key.toId();
+        GridTypes.PoolState storage pool = _poolStates[poolId];
+
+        if (block.number != pool.lastSwapBlock) {
+            (, int24 tick,,) = poolManager.getSlot0(poolId);
+            pool.blockStartTick = tick;
+            pool.swapsThisBlock = 0;
+            pool.lastSwapBlock = block.number;
+        }
+        pool.swapsThisBlock += 1;
+
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -437,6 +464,14 @@ contract GridHook is IHooks, IUnlockCallback, Permit2Forwarder, Multicall_v4 {
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
         pool.currentTick = currentTick;
         pool.swapCount += 1;
+
+        // Enforce max cumulative price impact per block
+        int24 tickDelta = currentTick > pool.blockStartTick
+            ? currentTick - pool.blockStartTick
+            : pool.blockStartTick - currentTick;
+        if (tickDelta > int24(uint24(MAX_TICK_MOVEMENT_PER_BLOCK))) {
+            revert ExcessivePriceImpact(tickDelta, MAX_TICK_MOVEMENT_PER_BLOCK);
+        }
 
         emit SwapObserved(poolId, params.zeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
         return (IHooks.afterSwap.selector, 0);

@@ -55,7 +55,7 @@ contract GridHookForkTest is Test {
 
         uint160 flags = uint160(
             Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.AFTER_SWAP_FLAG
+                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address hookAddr = address(uint160(type(uint160).max & ~uint160(Hooks.ALL_HOOK_MASK)) | flags);
 
@@ -139,8 +139,9 @@ contract GridHookForkTest is Test {
     function test_fork_swapUpdatesPoolState() public {
         _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
 
+        // Use a small swap to stay within MAX_TICK_MOVEMENT_PER_BLOCK (500 ticks)
         SwapParams memory params =
-            SwapParams({ zeroForOne: true, amountSpecified: -1e12, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+            SwapParams({ zeroForOne: true, amountSpecified: -1e10, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
 
         swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
 
@@ -162,6 +163,10 @@ contract GridHookForkTest is Test {
 
         // Re-approve for rebalance settlement
         _approveHookForTokens(address(this));
+
+        // Advance block and time to satisfy MEV guards
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 61);
 
         hook.rebalance(key, address(this), type(uint256).max);
 
@@ -185,6 +190,10 @@ contract GridHookForkTest is Test {
 
         _approveHookForTokens(address(this));
 
+        // Advance block and time to satisfy MEV guards
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 61);
+
         // Authorize alice as keeper, then trigger rebalance for address(this)
         hook.setRebalanceKeeper(alice, true);
 
@@ -203,6 +212,10 @@ contract GridHookForkTest is Test {
         swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
 
         _approveHookForTokens(address(this));
+
+        // Advance block and time to satisfy MEV guards
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 61);
 
         vm.expectEmit(true, true, false, false);
         emit GridHook.GridRebalanced(key.toId(), address(this), int24(0), int24(0));
@@ -304,6 +317,10 @@ contract GridHookForkTest is Test {
 
         // Re-approve alice for rebalance
         _approveHookForUser(alice);
+
+        // Advance block and time to satisfy MEV guards
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 61);
 
         // Rebalance only alice (as alice herself)
         vm.prank(alice);
@@ -420,6 +437,139 @@ contract GridHookForkTest is Test {
 
         vm.expectRevert(GridHook.NoAssetsAvailable.selector);
         hook.deployGrid(key, 0, 0, 0, type(uint256).max);
+    }
+
+    // ==================== MEV Protection ====================
+
+    function test_fork_antiSandwich_blocksExcessivePriceImpact() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // A massive swap that should exceed MAX_TICK_MOVEMENT_PER_BLOCK (500 ticks)
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+
+        vm.expectRevert();
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+    }
+
+    function test_fork_antiSandwich_allowsNormalSwap() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // A small swap that should stay within limits
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e10, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        GridTypes.PoolState memory poolState = hook.getPoolState(key);
+        assertEq(poolState.swapCount, 1);
+        assertTrue(poolState.swapsThisBlock == 1);
+        assertEq(poolState.lastSwapBlock, block.number);
+    }
+
+    function test_fork_antiSandwich_tracksBlockStartTick() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // First small swap
+        SwapParams memory params1 =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e9, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params1, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        GridTypes.PoolState memory stateAfterFirst = hook.getPoolState(key);
+        int24 blockStartTick = stateAfterFirst.blockStartTick;
+        assertEq(blockStartTick, 0, "blockStartTick should be 0 (initial tick)");
+        assertEq(stateAfterFirst.swapsThisBlock, 1);
+
+        // Second small swap in the same block — blockStartTick should not change
+        SwapParams memory params2 =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e9, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params2, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        GridTypes.PoolState memory stateAfterSecond = hook.getPoolState(key);
+        assertEq(stateAfterSecond.blockStartTick, blockStartTick, "blockStartTick should not change within same block");
+        assertEq(stateAfterSecond.swapsThisBlock, 2);
+    }
+
+    function test_fork_rebalanceRevertsInSameBlockAsSwap() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // Small swap to set lastSwapBlock to current block
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e10, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        _approveHookForTokens(address(this));
+
+        // Rebalance in same block should revert
+        vm.expectRevert(GridHook.RebalanceInSameBlockAsSwap.selector);
+        hook.rebalance(key, address(this), type(uint256).max);
+    }
+
+    function test_fork_rebalanceCooldownEnforced() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // Swap to move price
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -2e11, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        _approveHookForTokens(address(this));
+
+        // Advance block and time so same-block + cooldown checks pass
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 61);
+        hook.rebalance(key, address(this), type(uint256).max);
+
+        // Swap again to move price further
+        SwapParams memory params2 =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e11, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params2, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        _approveHookForTokens(address(this));
+
+        // Advance block but NOT enough time — cooldown should block
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 30); // only 30s, cooldown is 60s
+
+        vm.expectRevert(GridHook.RebalanceCooldownNotMet.selector);
+        hook.rebalance(key, address(this), type(uint256).max);
+    }
+
+    function test_fork_keeperCannotRebalanceDuringVolatileBlock() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // Swap to move price
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -1e10, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        _approveHookForTokens(address(this));
+        hook.setRebalanceKeeper(alice, true);
+
+        // Keeper tries to rebalance in same block as swap
+        vm.prank(alice);
+        vm.expectRevert(GridHook.RebalanceInSameBlockAsSwap.selector);
+        hook.rebalance(key, address(this), type(uint256).max);
+    }
+
+    function test_fork_rebalanceSucceedsAfterBlockAdvances() public {
+        _setupFullGrid(address(this), GridTypes.DistributionType.FIBONACCI, 5);
+
+        // Swap to move price
+        SwapParams memory params =
+            SwapParams({ zeroForOne: true, amountSpecified: -2e11, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1 });
+        swapRouter.swap(key, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+
+        _approveHookForTokens(address(this));
+
+        // Advance block and enough time
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 120);
+
+        hook.rebalance(key, address(this), type(uint256).max);
+
+        GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
+        assertEq(userState.rebalanceCount, 1);
     }
 
     // ==================== Helpers ====================

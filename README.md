@@ -21,6 +21,8 @@ The purpose of this project is to leverage Uniswap V4's concentrated liquidity m
 - **Deadline Protection**: All mutative grid operations (`deployGrid`, `rebalance`, `closeGrid`) require a `deadline` parameter and revert with `DeadlineExpired` if `block.timestamp > deadline`.
 - **On-Chain Rebalance Threshold**: `rebalanceThresholdBps` is enforced on-chain — the rebalance reverts with `RebalanceThresholdNotMet` if the tick has not moved far enough, preventing no-op or dust rebalances.
 - **Reentrancy Guard**: All external payable entry points use a transient-storage–based reentrancy lock, preventing `multicall` + `msg.value` reuse and other reentrancy vectors.
+- **MEV / Sandwich Protection**: The hook uses `beforeSwap` to snapshot the tick at the start of each block and `afterSwap` to enforce a maximum cumulative price movement of 500 ticks per block (`MAX_TICK_MOVEMENT_PER_BLOCK`). Swaps that would exceed this limit revert with `ExcessivePriceImpact`, making large sandwich attacks unprofitable.
+- **Rebalance Timing Guards**: Rebalances are blocked in the same block as any swap (`RebalanceInSameBlockAsSwap`) and are subject to a 60-second cooldown (`MIN_REBALANCE_COOLDOWN`) between consecutive rebalances for the same user. This prevents MEV bots from atomically swapping + rebalancing and limits rapid-fire manipulation.
 - **Native ETH Support**: Grid operations are `payable` and the settlement layer handles native ETH pools automatically. `receive()` is restricted to the PoolManager.
 - **Close Grid**: Users can close their grid at any time to remove all positions and receive tokens back.
 - **Automated Liquidity Management**: Deploy and manage liquidity positions across multiple price ranges.
@@ -67,6 +69,9 @@ These distribution types allow users to customize how liquidity is allocated acr
 - **TickRangeOutOfBounds(int24 bottomTick, int24 topTick)**: The computed grid range falls outside the valid tick range (`TickMath.MIN_TICK` / `TickMath.MAX_TICK`).
 - **DeadlineExpired()**: The transaction was submitted after the caller-specified deadline.
 - **RebalanceThresholdNotMet(int24 tickDelta, int24 minTickDelta)**: The tick has not moved far enough from the grid center to justify a rebalance.
+- **ExcessivePriceImpact(int24 tickDelta, uint16 maxAllowed)**: The cumulative tick movement within the current block exceeds `MAX_TICK_MOVEMENT_PER_BLOCK` (500 ticks). This prevents sandwich attacks from moving the price too far in a single block.
+- **RebalanceInSameBlockAsSwap()**: A rebalance was attempted in the same block as a swap. Rebalances must occur in a subsequent block to prevent atomic swap+rebalance MEV.
+- **RebalanceCooldownNotMet()**: A rebalance was attempted before the 60-second cooldown (`MIN_REBALANCE_COOLDOWN`) elapsed since the user's last action (deploy or rebalance).
 - **Reentrancy()**: A reentrant call was detected.
 
 ## Usage
@@ -239,7 +244,7 @@ hook.closeGrid(poolKey, block.timestamp + 300);
 
 ## Architecture
 
-- `src/hooks/GridHook.sol`: singleton hook entrypoint — multi-tenant state container keyed by `(address user, PoolId)`. Inherits `Permit2Forwarder` and `Multicall_v4` from v4-periphery. Includes Permit2 settlement, keeper authorization, slippage protection, deadline enforcement, on-chain rebalance threshold, reentrancy guard, and native ETH settlement.
+- `src/hooks/GridHook.sol`: singleton hook entrypoint — multi-tenant state container keyed by `(address user, PoolId)`. Inherits `Permit2Forwarder` and `Multicall_v4` from v4-periphery. Includes Permit2 settlement, keeper authorization, slippage protection, deadline enforcement, on-chain rebalance threshold, reentrancy guard, native ETH settlement, and MEV protection (per-block tick movement cap, same-block rebalance guard, rebalance cooldown).
 - `src/libraries/GridTypes.sol`: shared enums and structs (`GridConfig`, `GridOrder`, `PoolState`, `UserGridState`)
 - `src/libraries/DistributionWeights.sol`: deterministic weight generation for flat, linear, reverse-linear, Fibonacci, sigmoid, and logarithmic grids
 - `script/DeployGridHook.s.sol`: CREATE2 deployment script with automatic salt mining for hook-flag-compatible addresses. Supports multi-chain deterministic deploys.
@@ -251,7 +256,7 @@ hook.closeGrid(poolKey, block.timestamp + 300);
 
 | Scope | Key | Struct | Description |
 |---|---|---|---|
-| Pool-level | `PoolId` | `PoolState` | `initialized`, `currentTick`, `swapCount` |
+| Pool-level | `PoolId` | `PoolState` | `initialized`, `currentTick`, `swapCount`, `lastSwapBlock`, `blockStartTick`, `swapsThisBlock` |
 | User-level | `(address, PoolId)` | `UserGridState` | `deployed`, `gridCenterTick` |
 | User-level | `(address, PoolId)` | `GridConfig` | Grid parameters set by the user |
 | User-level | `(address, PoolId)` | `uint256[]` | Pre-computed distribution weights |
@@ -284,12 +289,13 @@ In practice this means:
 
 ## Hook Model
 
-The starter hook enables these callbacks:
+The hook enables these callbacks:
 
 - `afterInitialize`
 - `afterAddLiquidity`
 - `afterRemoveLiquidity`
-- `afterSwap`
+- `beforeSwap` — snapshots the tick at the start of each block and tracks per-block swap count for MEV protection
+- `afterSwap` — enforces the 500-tick cumulative price movement limit per block
 
 Uniswap v4 activates hooks from the least-significant bits of the deployed hook address. This repo exposes the required flag bitmap through `GridHook.requiredHookFlags()` so deployment tooling can mine or derive a compatible address.
 

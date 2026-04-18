@@ -79,7 +79,7 @@ contract GridHookTest is Test {
 
         uint160 flags = uint160(
             Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.AFTER_SWAP_FLAG
+                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         address hookAddr = address(uint160(type(uint160).max & ~uint160(Hooks.ALL_HOOK_MASK)) | flags);
 
@@ -102,7 +102,7 @@ contract GridHookTest is Test {
         assertTrue(permissions.afterAddLiquidity);
         assertFalse(permissions.beforeRemoveLiquidity);
         assertTrue(permissions.afterRemoveLiquidity);
-        assertFalse(permissions.beforeSwap);
+        assertTrue(permissions.beforeSwap);
         assertTrue(permissions.afterSwap);
         assertFalse(permissions.beforeDonate);
         assertFalse(permissions.afterDonate);
@@ -174,7 +174,7 @@ contract GridHookTest is Test {
     function testConstructorRevertsForZeroPoolManager() external {
         uint160 flags = uint160(
             Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
-                | Hooks.AFTER_SWAP_FLAG
+                | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
         );
         // We expect the revert before validateHookPermissions, so we can use any address
         vm.expectRevert(GridHook.PoolManagerAddressZero.selector);
@@ -346,6 +346,7 @@ contract GridHookTest is Test {
 
         // Rebalance should also succeed with zero-liquidity orders
         _setMockSlot0(key, 300);
+        vm.warp(block.timestamp + 61);
         hook.rebalance(key, address(this), type(uint256).max);
         assertEq(hook.getUserState(key, address(this)).gridCenterTick, 300);
 
@@ -456,6 +457,7 @@ contract GridHookTest is Test {
 
         _setMockSlot0(key, 300);
 
+        vm.warp(block.timestamp + 61);
         hook.rebalance(key, address(this), type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
@@ -484,6 +486,7 @@ contract GridHookTest is Test {
         _setMockSlot0(key, 300);
 
         vm.prank(alice);
+        vm.warp(block.timestamp + 61);
         hook.rebalance(key, address(this), type(uint256).max);
 
         GridTypes.UserGridState memory userState = hook.getUserState(key, address(this));
@@ -523,6 +526,7 @@ contract GridHookTest is Test {
 
         // Rebalance alice's grid as alice herself
         vm.prank(alice);
+        vm.warp(block.timestamp + 61);
         hook.rebalance(key, alice, type(uint256).max);
 
         assertEq(hook.getUserState(key, alice).gridCenterTick, 300);

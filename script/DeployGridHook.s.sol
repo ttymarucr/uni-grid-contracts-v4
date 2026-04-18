@@ -37,7 +37,7 @@ contract DeployGridHookScript is Script {
 
     /// @dev Exact hook-flag mask that GridHook requires (from requiredHookFlags()).
     uint160 constant REQUIRED_FLAGS = Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
-        | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG;
+        | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG;
 
     // ──────────────────────────────  ENTRY POINTS  ──────────────────────────────
 
