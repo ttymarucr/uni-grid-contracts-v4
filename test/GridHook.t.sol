@@ -379,6 +379,18 @@ contract GridHookTest is Test {
         _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.LOGARITHMIC);
     }
 
+    function testDeployWithZeroLiquidityOrders_ReverseFibonacci() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.REVERSE_FIBONACCI);
+    }
+
+    function testDeployWithZeroLiquidityOrders_Bell() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.BELL);
+    }
+
+    function testDeployWithZeroLiquidityOrders_UShape() external {
+        _deployAndVerifyZeroLiquidityOrders(GridTypes.DistributionType.U_SHAPE);
+    }
+
     function testDeployGridRevertsWhenNotConfigured() external {
         PoolKey memory key = _poolKey();
 

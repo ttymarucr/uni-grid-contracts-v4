@@ -55,6 +55,18 @@ library DistributionWeights {
             return _logarithmicWeights(gridLength);
         }
 
+        if (distributionType == GridTypes.DistributionType.REVERSE_FIBONACCI) {
+            return _reverseFibonacciWeights(gridLength);
+        }
+
+        if (distributionType == GridTypes.DistributionType.BELL) {
+            return _bellWeights(gridLength);
+        }
+
+        if (distributionType == GridTypes.DistributionType.U_SHAPE) {
+            return _uShapeWeights(gridLength);
+        }
+
         // Fibonacci (default fallback for the enum)
         if (gridLength == 1) {
             weights[0] = TOTAL_BPS;
@@ -145,6 +157,89 @@ library DistributionWeights {
             }
 
             // Normalise to TOTAL_BPS
+            for (uint256 i; i < gridLength; ++i) {
+                weights[i] = (weights[i] * TOTAL_BPS) / total;
+            }
+        }
+    }
+
+    /// @dev Reverse Fibonacci: same Fibonacci sequence but mirrored so the
+    ///      highest weight is at index 0 and the lowest at the end.
+    function _reverseFibonacciWeights(
+        uint256 gridLength
+    ) private pure returns (uint256[] memory weights) {
+        weights = new uint256[](gridLength);
+
+        if (gridLength == 1) {
+            weights[0] = TOTAL_BPS;
+            return weights;
+        }
+
+        uint256 total = 2;
+        uint256[] memory fwd = new uint256[](gridLength);
+        fwd[0] = 1;
+        fwd[1] = 1;
+
+        uint256 previous = 1;
+        uint256 current = 1;
+        unchecked {
+            for (uint256 i = 2; i < gridLength; ++i) {
+                uint256 nextValue = previous + current;
+                fwd[i] = nextValue;
+                total += nextValue;
+                previous = current;
+                current = nextValue;
+            }
+
+            // Reverse: weights[i] = fwd[gridLength - 1 - i]
+            for (uint256 i; i < gridLength; ++i) {
+                weights[i] = (fwd[gridLength - 1 - i] * TOTAL_BPS) / total;
+            }
+        }
+    }
+
+    /// @dev Bell distribution: high liquidity at the center, tapering linearly
+    ///      and symmetrically toward both edges.  For neutral / range-bound
+    ///      markets where price oscillates around the current level.
+    ///      weight[i] = distance_from_nearest_edge + 1  (triangle peak at centre).
+    function _bellWeights(
+        uint256 gridLength
+    ) private pure returns (uint256[] memory weights) {
+        weights = new uint256[](gridLength);
+        uint256 total;
+
+        unchecked {
+            for (uint256 i; i < gridLength; ++i) {
+                uint256 distFromEdge = i < gridLength - 1 - i ? i : gridLength - 1 - i;
+                uint256 value = distFromEdge + 1;
+                weights[i] = value;
+                total += value;
+            }
+
+            for (uint256 i; i < gridLength; ++i) {
+                weights[i] = (weights[i] * TOTAL_BPS) / total;
+            }
+        }
+    }
+
+    /// @dev U-shape distribution: high liquidity at both edges, tapering
+    ///      linearly toward the center.  For high-volatility markets where
+    ///      price swings between extremes.
+    ///      weight[i] = distance_from_center + 1  (valleys at centre, peaks at edges).
+    function _uShapeWeights(
+        uint256 gridLength
+    ) private pure returns (uint256[] memory weights) {
+        weights = new uint256[](gridLength);
+        uint256 total;
+
+        unchecked {
+            for (uint256 i; i < gridLength; ++i) {
+                uint256 distFromCenter = i > gridLength - 1 - i ? i : gridLength - 1 - i;
+                uint256 value = distFromCenter + 1;
+                weights[i] = value;
+                total += value;
+            }
+
             for (uint256 i; i < gridLength; ++i) {
                 weights[i] = (weights[i] * TOTAL_BPS) / total;
             }

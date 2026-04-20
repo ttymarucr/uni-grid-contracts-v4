@@ -19,7 +19,7 @@ declare -A POOL_MANAGERS=(
   [optimism]="0x9a13f98cb987694c9f086b1f5eb990eea8264ec3"
 )
 
-CHAINS=( "mainnet" "bnb" "base" "arbitrum" "optimism")
+CHAINS=("unichain" "mainnet" "bnb" "base" "arbitrum" "optimism")
 
 for chain in "${CHAINS[@]}"; do
   pm="${POOL_MANAGERS[$chain]}"

@@ -8,7 +8,10 @@ library GridTypes {
         REVERSE_LINEAR,
         FIBONACCI,
         SIGMOID,
-        LOGARITHMIC
+        LOGARITHMIC,
+        REVERSE_FIBONACCI,
+        BELL,
+        U_SHAPE
     }
 
     struct GridConfig {
